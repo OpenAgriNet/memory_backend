@@ -1,0 +1,12 @@
+{
+  "max_total_chars": 700,
+  "fields": {
+    "name_used": {"description": "The name used in conversation, only when it adds something not already supplied by Amul's live record.", "max_chars": 80},
+    "usual_account": {"description": "Which linked account the farmer generally means. A preference to confirm, never an account number or account list.", "max_chars": 120},
+    "language_register": {"description": "Language and answer-style preferences supported by conversation. A single question in one language does not establish a lasting preference.", "max_chars": 120},
+    "animal_references": {"description": "Words the farmer consistently uses for an animal, only when the reference is clear. No ear tags or speculative identification.", "max_chars": 120},
+    "usual_topics": {"description": "Recurring conversational interests supported across separate conversations, not a list of current problems.", "max_chars": 120},
+    "standing_sensitivities": {"description": "An explicit request about tone or topics to avoid. Never infer or retain distress, private family details, or a sensitive personal history.", "max_chars": 120},
+    "explicit_requests": {"description": "Explicit, lasting conversational instructions such as keeping replies short or stopping a suggestion. Events to remember belong in ordinary memory.", "max_chars": 120}
+  }
+}
