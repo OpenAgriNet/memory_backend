@@ -40,6 +40,9 @@ and model endpoints. `.env` is ignored by git; process environment takes precede
 - `MEMORY_INTERNAL_TOKEN`: required bearer credential for the private memory API.
   Every route except `GET /health` requires it. This remains separate from the
   Qdrant credential; Dreamer attaches it through the shared memory client.
+- `MEMORY_WORKER_*`: bounded discovery and concurrency settings for the one-shot
+  worker. Defaults are production text traces, 30-minute inactivity, two-hour
+  incremental discovery, 48-hour reconciliation, and one farmer at a time.
 - `BACKTEST_API_URL`, `BACKTEST_COLLECTION`: isolated evaluation service and collection.
 
 Qdrant REST over HTTPS is sufficient; this implementation does not need gRPC.
@@ -156,11 +159,15 @@ write memory):
 ```bash
 python3 dreamer/dreamer.py --farmer <id> --days 30 --dry-run
 python3 dreamer/dreamer.py --farmer <id> --days 30 --until 2026-08-21T00:00:00Z
+python3 -m dreamer.worker --mode preflight
+python3 -m dreamer.worker --mode incremental --dry-run
+python3 -m dreamer.worker --mode reconcile
 ```
 
 The default is the tool-using agent. `--pipeline` retains the older baseline for
 comparison; it is not an automatic fallback. Credentials are resolved at runtime,
-never copied into memory or these docs. Langfuse access is read-only.
+never copied into memory or these docs. Langfuse access is read-only. The worker is
+one-shot; its 15-minute and midnight schedules remain deployment concerns.
 
 ## Verification
 

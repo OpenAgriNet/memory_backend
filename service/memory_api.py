@@ -412,15 +412,17 @@ async def _checkpoint_qdrant(method: str, path: str, payload: dict | None = None
         raise
 
 
-async def _require_checkpoint_mutations() -> None:
+async def _require_checkpoint_mutations() -> str:
     """Qdrant 1.17 introduced the update modes required for atomic leases."""
     try:
         info = await _qdrant("GET", "/")
-        parts = tuple(int(part) for part in str(info.get("version", "0.0.0")).split(".")[:2])
+        version = str(info.get("version", "0.0.0"))
+        parts = tuple(int(part) for part in version.split(".")[:2])
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(503, "cannot verify atomic checkpoint support") from exc
     if parts < (1, 17):
         raise HTTPException(503, "Qdrant 1.17 or newer is required for atomic checkpoints")
+    return version
 
 
 async def _ensure_collection() -> None:
@@ -1592,6 +1594,11 @@ async def _read_episode_chunks(farmer_id: str, entry_id: str, req: ChunkReadRequ
 
 
 # ---------- durable worker checkpoints ----------
+
+@app.get("/internal/checkpoints/capabilities", include_in_schema=False)
+async def checkpoint_capabilities() -> dict:
+    version = await _require_checkpoint_mutations()
+    return {"atomic_mutations": True, "qdrant_version": version, "minimum_version": "1.17"}
 
 @app.post("/internal/checkpoints/lookup", include_in_schema=False)
 async def checkpoint_lookup(req: checkpoints.CheckpointLookupRequest) -> dict:

@@ -142,7 +142,8 @@ EXTRACT_SCHEMA = {
 def build_extract_prompt(turns, known_keys, farmer_label):
     """One chunk of at most CHUNK_TURNS turns, plus the key vocabulary already in use."""
     convo = "\n\n".join(
-        f"Turn {n} [{dates.fmt(t.get('ts'))}] FARMER: {t['query']}\nASSISTANT: {t['answer']}"
+        f"Turn {n}{' [CONTEXT ONLY - do not cite]' if t.get('context_only') else ''} "
+        f"[{dates.fmt(t.get('ts'))}] FARMER: {t['query']}\nASSISTANT: {t['answer']}"
         for n, t in enumerate(turns, 1) if t.get("query")
     )
     if known_keys:
