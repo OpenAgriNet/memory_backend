@@ -5,6 +5,7 @@ GET only; nothing is written back to Langfuse.
 """
 import datetime as dt
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -24,11 +25,13 @@ class LangfuseRO:
         self.base = config[names[0]].rstrip("/")
         self.auth = (config[names[1]], config[names[2]])
         self.s = requests.Session()
+        self._lock = threading.Lock()
 
     def _get(self, path, params=None, retries=4):
         for attempt in range(retries):
             try:
-                r = self.s.get(f"{self.base}{path}", auth=self.auth, params=params, timeout=180)
+                with self._lock:
+                    r = self.s.get(f"{self.base}{path}", auth=self.auth, params=params, timeout=180)
             except requests.RequestException:
                 if attempt == retries - 1:
                     raise
@@ -45,6 +48,33 @@ class LangfuseRO:
             r.raise_for_status()
         raise RuntimeError(f"GET {path} failed after {retries} attempts")
 
+    def trace_window(self, start, stop, **filters):
+        """Read every trace in a bounded window, splitting only oversized windows."""
+        params = {
+            "fromTimestamp": iso(start), "toTimestamp": iso(stop), "limit": 100,
+            "fields": "core,io", **filters,
+        }
+        rows, page = [], 1
+        try:
+            while True:
+                params["page"] = page
+                data = self._get("/api/public/traces", params)
+                items = data.get("data", [])
+                rows.extend(items)
+                if not items or page >= (data.get("meta", {}).get("totalPages") or 1):
+                    return rows
+                page += 1
+        except TimeoutError:
+            if stop - start <= dt.timedelta(hours=1):
+                raise
+            middle = start + (stop - start) / 2
+            return self.trace_window(start, middle, **filters) + self.trace_window(
+                middle, stop, **filters,
+            )
+
+    def session_traces(self, session_id, start, stop):
+        return self.trace_window(start, stop, name=CHAT_TRACE_NAME, sessionId=session_id)
+
     def farmer_turns(self, farmer_id, days_back=30, until=None):
         """Every chat turn for one farmer, oldest first.
 
@@ -56,29 +86,10 @@ class LangfuseRO:
                if until else dt.datetime.now(dt.timezone.utc))
         if end.tzinfo is None:
             end = end.replace(tzinfo=dt.timezone.utc)
-        def read_window(start, stop):
-            params = {"userId": str(farmer_id), "name": CHAT_TRACE_NAME,
-                      "fromTimestamp": iso(start), "toTimestamp": iso(stop), "limit": 100,
-                      "fields": "core,io"}  # Avoid unrelated observation/score/metric joins.
-
-            rows, page = [], 1
-            try:
-                while True:
-                    params["page"] = page
-                    data = self._get("/api/public/traces", params)
-                    items = data.get("data", [])
-                    rows.extend(items)
-                    if not items or page >= (data.get("meta", {}).get("totalPages") or 1):
-                        return rows
-                    page += 1
-            except TimeoutError:
-                if stop - start <= dt.timedelta(hours=1):
-                    raise
-                middle = start + (stop - start) / 2
-                return read_window(start, middle) + read_window(middle, stop)
-
         out = {}
-        for t in read_window(end - dt.timedelta(days=days_back), end):
+        for t in self.trace_window(
+                end - dt.timedelta(days=days_back), end,
+                userId=str(farmer_id), name=CHAT_TRACE_NAME):
             inp = t.get("input") or {}
             trace_id = t.get("id")
             if not trace_id:

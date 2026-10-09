@@ -44,6 +44,7 @@ Look before you write. Search what is already remembered — more than once, wit
 Before rewriting an existing account, use read_memory to inspect its detail, following the returned continuation when present. Search previews may be incomplete.
 
 For every write or update, provide source_turns: the numbers of only the turns supporting that situation. Dates, source links, and session counts are derived by code. Never attach unrelated turns.
+Turns labelled CONTEXT ONLY help interpret a resumed session but can never be selected in source_turns.
 
 Then decide, for each thing worth remembering:
 - Already on record and this conversation moved it along -> update_memory. This is the case you should be actively looking for.
@@ -105,7 +106,8 @@ def dream(api, farmer_id, turns, *, source_ts=None, session_id=None,
                     trace_ids=trace_ids)
 
     convo = "\n\n".join(
-        f"Turn {n} [{(t.get('ts') or '')[:10]}] FARMER: {t['query']}\nASSISTANT: {t.get('answer') or ''}"
+        f"Turn {n}{' [CONTEXT ONLY]' if t.get('context_only') else ''} "
+        f"[{(t.get('ts') or '')[:10]}] FARMER: {t['query']}\nASSISTANT: {t.get('answer') or ''}"
         for n, t in enumerate(turns, 1) if (t.get("query") or "").strip()
     )
     keys = "\n".join(f"- {k['key']}: {k.get('description') or '(undocumented)'}"
@@ -127,6 +129,7 @@ TURNS:
             msg = llm.chat(messages, tools=tools.SCHEMAS, max_tokens=1500)
         except Exception as exc:  # noqa: BLE001
             print(f"  ! agent step failed ({exc}); stopping this chunk", file=sys.stderr)
+            ctx.error = exc
             break
 
         raw_calls = getattr(msg, "tool_calls", None) or []

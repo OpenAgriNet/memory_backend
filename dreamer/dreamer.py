@@ -462,7 +462,7 @@ def _current_entries(farmer_id):
         seen.add(cursor)
 
 
-def consolidate(farmer_id, dry_run=False, min_confidence="medium", known_keys=()):
+def consolidate(farmer_id, dry_run=False, min_confidence="medium", known_keys=(), strict=False):
     """Find entries that are the same situation and merge them into one.
 
     Returns a list of (situation, kept_id, folded_ids).
@@ -470,6 +470,8 @@ def consolidate(farmer_id, dry_run=False, min_confidence="medium", known_keys=()
     try:
         entries = _current_entries(farmer_id)
     except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
         print(f"  ! could not read entries for consolidation ({exc})", file=sys.stderr)
         return []
     if len(entries) < 2:
@@ -492,6 +494,8 @@ def consolidate(farmer_id, dry_run=False, min_confidence="medium", known_keys=()
                 max_tokens=1500,
             )
         except Exception as exc:  # noqa: BLE001
+            if strict:
+                raise
             print(f"  ! clustering failed ({exc}); leaving entries as they are", file=sys.stderr)
             continue
         allowed = {"high", "medium"} if min_confidence == "medium" else {"high"}
@@ -500,8 +504,9 @@ def consolidate(farmer_id, dry_run=False, min_confidence="medium", known_keys=()
             if len(idx) < 2:
                 continue
             if (g.get("confidence") or "low") not in allowed:
-                print(f"      skipped a {g.get('confidence')}-confidence group: "
-                      f"{(g.get('situation') or '')[:60]}")
+                if not strict:
+                    print(f"      skipped a {g.get('confidence')}-confidence group: "
+                          f"{(g.get('situation') or '')[:60]}")
                 continue
             groups.append(([window[n - 1] for n in idx], g.get("situation") or "",
                            g.get("reason") or ""))
@@ -525,6 +530,8 @@ def consolidate(farmer_id, dry_run=False, min_confidence="medium", known_keys=()
                 max_tokens=1800,
             )
         except Exception as exc:  # noqa: BLE001
+            if strict:
+                raise
             print(f"  ! merge synthesis failed ({exc}); fragments left alone", file=sys.stderr)
             continue
 
@@ -578,10 +585,13 @@ def consolidate(farmer_id, dry_run=False, min_confidence="medium", known_keys=()
             # what licenses "raised repeatedly".
             "_existing": keep, "_evidence": frag_evidence, "_record": agg,
         })
-        for n in res.get("notes") or []:
-            print(f"      judge: {n[:120]}")
+        if not strict:
+            for n in res.get("notes") or []:
+                print(f"      judge: {n[:120]}")
         if not res.get("ok"):
             why = "; ".join(res.get("reasons") or []) or res.get("reason") or res.get("error", "refused")
+            if strict:
+                raise RuntimeError(f"merge refused: {why}")
             print(f"      merge NOT APPLIED: {why[:140]} — fragments left alone")
             continue
         new_id = res["entry_id"]
@@ -593,6 +603,8 @@ def consolidate(farmer_id, dry_run=False, min_confidence="medium", known_keys=()
             if fr.get("ok"):
                 folded.append(f["id"])
             else:
+                if strict:
+                    raise RuntimeError(f"could not fold memory: {fr.get('error', 'refused')}")
                 print(f"  ! could not fold {f['id']}: {fr.get('error')}", file=sys.stderr)
         done.append((situation, new_id, folded))
     return done
@@ -602,7 +614,7 @@ def consolidate(farmer_id, dry_run=False, min_confidence="medium", known_keys=()
 # Layer 1 — once per farmer, after their chunks are done
 # --------------------------------------------------------------------------
 
-def update_profile(farmer_id, dry_run=False, recent_asks=()):
+def update_profile(farmer_id, dry_run=False, recent_asks=(), strict=False):
     """Re-derive the standing record from what is now remembered about the farmer.
 
     `recent_asks` is a small sample of the farmer's own words, carried over from the
@@ -617,6 +629,8 @@ def update_profile(farmer_id, dry_run=False, recent_asks=()):
         headlines = sorted(_current_entries(farmer_id),
                            key=lambda e: e.get("source_ts") or "", reverse=True)[:PROFILE_CONTEXT]
     except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
         print(f"  ! could not read state for the standing record ({exc}); skipping",
               file=sys.stderr)
         return None
@@ -635,6 +649,8 @@ def update_profile(farmer_id, dry_run=False, recent_asks=()):
             max_tokens=600,
         )
     except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise
         print(f"  ! standing record pass failed ({exc}); leaving it as it was", file=sys.stderr)
         return None
 
@@ -652,6 +668,8 @@ def update_profile(farmer_id, dry_run=False, recent_asks=()):
     ctx = tools.Ctx(MEMORY_API, farmer_id, turns=[{"query": ask} for ask in recent_asks])
     result = writer.apply(ctx, {"op": "profile", "fields": fields, "_evidence": evidence})
     if not result.get("ok"):
+        if strict:
+            raise RuntimeError("standing record was refused")
         print("  ! standing record not saved: " + str(result.get("reasons") or result.get("error")), file=sys.stderr)
         return None
     if result.get("unchanged"):

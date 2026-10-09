@@ -43,6 +43,7 @@ class Ctx:
         self.blocked: list[dict] = []     # what the judges refused, and why
         self.seen_headlines: set[str] = set()  # idempotency within one agent run
         self.refusals: dict[str, int] = {}     # per-entry refusal count, to stop retry loops
+        self.error: Exception | None = None
 
     def for_sources(self, numbers):
         """Keep shared run bookkeeping, but restrict evidence to selected turns."""
@@ -51,6 +52,8 @@ class Ctx:
         if (not isinstance(numbers, list) or not numbers or any(
                 type(n) is not int or n < 1 or n > len(self.turns) for n in numbers)):
             raise ValueError("source_turns must list supporting turn numbers from this chunk")
+        if any(self.turns[n - 1].get("context_only") for n in numbers):
+            raise ValueError("context-only turns cannot be used as memory evidence")
         selected = copy(self)
         selected.turns = [self.turns[n - 1] for n in sorted(set(numbers))]
         selected.trace_ids = [t["trace_id"] for t in selected.turns if t.get("trace_id")]
