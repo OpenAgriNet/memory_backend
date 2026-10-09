@@ -24,9 +24,12 @@ PREFIX = "zz-test-"
 
 
 def _req(method, url, body=None):
+    headers = {"Content-Type": "application/json"}
+    if url.startswith(API):
+        headers["Authorization"] = f"Bearer {os.environ['MEMORY_INTERNAL_TOKEN']}"
     r = urllib.request.Request(
         url, data=json.dumps(body).encode() if body is not None else None,
-        headers={"Content-Type": "application/json"}, method=method)
+        headers=headers, method=method)
     return json.load(urllib.request.urlopen(r, timeout=90))
 
 

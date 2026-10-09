@@ -13,7 +13,7 @@ service = None
 name = "amul-chunk-tests-" + uuid.uuid4().hex[:8]
 try:
     subprocess.run(["docker", "run", "--rm", "-d", "--name", name,
-                    "-p", "127.0.0.1::6333", "qdrant/qdrant:latest"], check=True, stdout=subprocess.DEVNULL)
+                    "-p", "127.0.0.1::6333", "qdrant/qdrant:v1.19.1"], check=True, stdout=subprocess.DEVNULL)
     address = subprocess.check_output(["docker", "port", name, "6333/tcp"], text=True).strip()
     endpoint = "http://" + address
     for attempt in range(60):
@@ -24,7 +24,8 @@ try:
             time.sleep(0.2)
     else:
         raise RuntimeError("test Qdrant did not become ready")
-    env = dict(os.environ, AMUL_CHUNK_TEST_QDRANT=endpoint, QDRANT_URL=endpoint, QDRANT_API_KEY="")
+    env = dict(os.environ, AMUL_CHUNK_TEST_QDRANT=endpoint, QDRANT_URL=endpoint, QDRANT_API_KEY="",
+               MEMORY_INTERNAL_TOKEN="isolated-memory-test-token")
     result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_episode_chunks.py", "-v"],
                             cwd=Path(__file__).resolve().parents[1], env=env)
     if result.returncode == 0:
@@ -48,6 +49,9 @@ try:
                 raise RuntimeError(log.read().decode())
             result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_service.py", "-v"],
                                     cwd=Path(__file__).resolve().parents[1], env=env)
+            if result.returncode == 0:
+                result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_checkpoints.py", "-v"],
+                                        cwd=Path(__file__).resolve().parents[1], env=env)
 finally:
     if service is not None:
         service.terminate()

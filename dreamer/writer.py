@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import re
 
-import requests
+import memory_client as requests
 
 import judges
 import llm

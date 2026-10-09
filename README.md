@@ -37,6 +37,9 @@ and model endpoints. `.env` is ignored by git; process environment takes precede
 - `MEMORY_API_URL`: private storage API called by the background job only. The bot
   uses `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_COLLECTION` and its existing
   `MARQO_ENDPOINT_URL`/`MARQO_INDEX_NAME` instead; see the bot's deployment guide.
+- `MEMORY_INTERNAL_TOKEN`: required bearer credential for the private memory API.
+  Every route except `GET /health` requires it. This remains separate from the
+  Qdrant credential; Dreamer attaches it through the shared memory client.
 - `BACKTEST_API_URL`, `BACKTEST_COLLECTION`: isolated evaluation service and collection.
 
 Qdrant REST over HTTPS is sufficient; this implementation does not need gRPC.
@@ -74,9 +77,10 @@ mandatory taxonomy. Unknown fields are omitted/reported; bounds are enforced.
 Only the administrative settings endpoint writes the separate Qdrant reply-use flag.
 The global bot switch defaults off. Per-farmer settings currently default on; explicit
 off and failed flag reads suppress reply memory. Background learning can continue via
-internal reads without changing that flag. Keep the service's writes and internal
-routes restricted to trusted callers; the service itself does not implement end-user
-authentication.
+internal reads without changing that flag. Keep the service network restricted to
+trusted callers as an additional boundary. The service requires its internal bearer
+token on all reads and writes; this is service-to-service authentication, not
+end-user authentication.
 
 The background agent proposes changes through `writer.apply`. Failed or malformed
 checks retry once, then block saving and report the proposal for retry. The standing

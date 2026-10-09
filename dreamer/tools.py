@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from copy import copy
 
-import requests
+import memory_client as requests
 
 import dates
 import writer

@@ -37,6 +37,7 @@ Scope: this service creates and updates memory in Qdrant. That is all it does. I
 does no ranking beyond Qdrant's own vector search, no reasoning, and no scheduling.
 """
 import os
+import hmac
 import json
 import math
 import re
@@ -45,14 +46,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 import profile_schema
 import episode
+import checkpoints
 from runtime_config import required, qdrant_headers
 
 QDRANT_URL = required("QDRANT_URL").rstrip("/")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "amul_memory")
+MEMORY_INTERNAL_TOKEN = required("MEMORY_INTERNAL_TOKEN")
 
 # ---------- embeddings ----------
 # Qdrant searches vectors but does not create them, so one external call is
@@ -73,6 +77,9 @@ COLLECTION = os.getenv("QDRANT_COLLECTION", "amul_memory")
 MARQO_URL = required("MARQO_URL").rstrip("/")
 MARQO_INDEX = os.getenv("MARQO_INDEX", "amul-veterinary-index")
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
+CHECKPOINT_LEASE_SECONDS = int(os.getenv("MEMORY_CHECKPOINT_LEASE_SECONDS", "3600"))
+if CHECKPOINT_LEASE_SECONDS <= 0:
+    raise RuntimeError("MEMORY_CHECKPOINT_LEASE_SECONDS must be positive")
 
 # Stamped onto every entry, so a future migration is detectable instead of silent.
 # The dangerous failure is not an outage — it is swapping the embedding service,
@@ -84,7 +91,8 @@ EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", f"marqo:{MARQO_INDEX}/doc-query")
 # records with category values remain readable and become plain memories on update.
 MEMORY_TYPE = "memory"
 CHUNK_TYPE = "memory_chunk"
-INTERNAL_TYPES = ("settings", "profile_record", "key_doc", CHUNK_TYPE)
+WORKER_CHECKPOINT_TYPE = "worker_checkpoint"
+INTERNAL_TYPES = ("settings", "profile_record", "key_doc", CHUNK_TYPE, WORKER_CHECKPOINT_TYPE)
 EntryStatus = Literal["open", "resolved", "pending", "n/a"]
 
 # A farmer's memory-on/off flag is stored here, in Qdrant, alongside their own
@@ -108,6 +116,29 @@ AGENT_HIDDEN_KEYS = {"animal_id", "account_no", "account_number", "transaction_i
 DEFAULT_MEMORY_ENABLED = True
 
 app = FastAPI(title="Amul memory API (test harness)")
+
+
+@app.middleware("http")
+async def _authenticate(request: Request, call_next):
+    """Secure every current and future route except the public liveness check."""
+    if request.method == "GET" and request.url.path == "/health":
+        return await call_next(request)
+    authorization = request.headers.get("Authorization", "")
+    scheme, separator, supplied = authorization.partition(" ")
+    valid = (
+        bool(separator)
+        and scheme.lower() == "bearer"
+        and bool(supplied)
+        and " " not in supplied
+        and hmac.compare_digest(supplied, MEMORY_INTERNAL_TOKEN)
+    )
+    if not valid:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await call_next(request)
 
 
 # ---------- models ----------
@@ -356,6 +387,7 @@ def _farmer_filter(
             {"key": "type", "match": {"value": SETTINGS_TYPE}},
             {"key": "type", "match": {"value": PROFILE_TYPE}},
             {"key": "type", "match": {"value": KEY_DOC_TYPE}},
+            {"key": "type", "match": {"value": WORKER_CHECKPOINT_TYPE}},
             *([] if include_chunks else [{"key": "type", "match": {"value": CHUNK_TYPE}}]),
         ],
     }
@@ -370,6 +402,27 @@ async def _qdrant(method: str, path: str, payload: dict | None = None) -> dict:
         return r.json()
 
 
+async def _checkpoint_qdrant(method: str, path: str, payload: dict | None = None) -> dict:
+    """Translate unsupported conditional writes into a fail-closed 503."""
+    try:
+        return await _qdrant(method, path, payload)
+    except HTTPException as exc:
+        if method == "PUT":
+            raise HTTPException(503, "atomic checkpoint storage is unavailable") from exc
+        raise
+
+
+async def _require_checkpoint_mutations() -> None:
+    """Qdrant 1.17 introduced the update modes required for atomic leases."""
+    try:
+        info = await _qdrant("GET", "/")
+        parts = tuple(int(part) for part in str(info.get("version", "0.0.0")).split(".")[:2])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(503, "cannot verify atomic checkpoint support") from exc
+    if parts < (1, 17):
+        raise HTTPException(503, "Qdrant 1.17 or newer is required for atomic checkpoints")
+
+
 async def _ensure_collection() -> None:
     """Create the collection and its payload indexes if they aren't there yet.
 
@@ -382,21 +435,21 @@ async def _ensure_collection() -> None:
     "expanded" (fuller detail, searched only via the recall tool). Nothing else —
     search here is semantic, so there is no keyword vector to maintain.
 
-    Existing collections are left exactly as they are; this never migrates or drops.
+    Existing collections are never dropped, but missing payload indexes are repaired.
     """
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.get(f"{QDRANT_URL}/collections/{COLLECTION}", headers=qdrant_headers(QDRANT_URL))
-        if r.status_code == 200:
-            return
-        if r.status_code != 404:
+        exists = r.status_code == 200
+        if not exists and r.status_code != 404:
             raise RuntimeError(f"Qdrant collection check failed: HTTP {r.status_code}; check endpoint and credentials")
 
-    await _qdrant("PUT", f"/collections/{COLLECTION}", {
-        "vectors": {
-            "headline": {"size": EMBED_DIM, "distance": "Cosine"},
-            "expanded": {"size": EMBED_DIM, "distance": "Cosine"},
-        },
-    })
+    if not exists:
+        await _qdrant("PUT", f"/collections/{COLLECTION}", {
+            "vectors": {
+                "headline": {"size": EMBED_DIM, "distance": "Cosine"},
+                "expanded": {"size": EMBED_DIM, "distance": "Cosine"},
+            },
+        })
     # Indexed because every read path filters on them. source_ts and expires_at are
     # datetime so range filters work; the rest are exact-match keywords.
     for field, schema in (
@@ -406,6 +459,12 @@ async def _ensure_collection() -> None:
         ("source_ts", "datetime"),
         ("episode_id", "keyword"),
         ("expires_at", "datetime"),
+        ("checkpoint_kind", "keyword"),
+        ("checkpoint_status", "keyword"),
+        ("checkpoint_version", "integer"),
+        ("checkpoint_next_retry_at", "datetime"),
+        ("checkpoint_lease_expires_at", "datetime"),
+        ("checkpoint_subject_id", "keyword"),
     ):
         await _qdrant("PUT", f"/collections/{COLLECTION}/index?wait=true",
                       {"field_name": field, "field_schema": schema})
@@ -426,6 +485,7 @@ async def _collection_embed_model() -> str | None:
                 {"key": "type", "match": {"value": SETTINGS_TYPE}},
                 {"key": "type", "match": {"value": KEY_DOC_TYPE}},
                 {"key": "type", "match": {"value": PROFILE_TYPE}},
+                {"key": "type", "match": {"value": WORKER_CHECKPOINT_TYPE}},
             ]},
             "limit": 1, "with_payload": True,
         })
@@ -1157,6 +1217,7 @@ async def coming_due(within_hours: int = 24, limit: int = 200) -> dict:
                 "must_not": [
                     {"key": "type", "match": {"value": SETTINGS_TYPE}},
                     {"key": "type", "match": {"value": PROFILE_TYPE}},
+                    {"key": "type", "match": {"value": WORKER_CHECKPOINT_TYPE}},
                 ],
             },
             "limit": limit,
@@ -1230,7 +1291,7 @@ async def list_keys(limit: int = 2000) -> dict:
         "POST",
         f"/collections/{COLLECTION}/points/scroll",
         {"limit": limit, "with_payload": True, "filter": {"must_not": [
-            {"key": "type", "match": {"any": [CHUNK_TYPE, SETTINGS_TYPE, PROFILE_TYPE]}}]}},
+            {"key": "type", "match": {"any": [CHUNK_TYPE, SETTINGS_TYPE, PROFILE_TYPE, WORKER_CHECKPOINT_TYPE]}}]}},
     )
     points = res["result"]["points"]
 
@@ -1292,6 +1353,7 @@ async def delete_key(key: str) -> dict:
             "filter": {"must_not": [
                 {"key": "type", "match": {"value": SETTINGS_TYPE}},
                 {"key": "type", "match": {"value": PROFILE_TYPE}},
+                {"key": "type", "match": {"value": WORKER_CHECKPOINT_TYPE}},
             ]},
         },
     )
@@ -1527,3 +1589,48 @@ async def _read_episode_chunks(farmer_id: str, entry_id: str, req: ChunkReadRequ
     summary = {k: v for k, v in entry.items() if k not in ("expanded", "chunks")}
     return {"entry": summary, "current": body["current"], "chunks": chunks,
             "continuation": continuation, "returned_chars": sum(len(c["text"]) for c in chunks)}
+
+
+# ---------- durable worker checkpoints ----------
+
+@app.post("/internal/checkpoints/lookup", include_in_schema=False)
+async def checkpoint_lookup(req: checkpoints.CheckpointLookupRequest) -> dict:
+    ids = [checkpoints.checkpoint_id(item.kind, item.subject_id) for item in req.subjects]
+    result = await _qdrant("POST", f"/collections/{COLLECTION}/points", {
+        "ids": ids, "with_payload": True, "with_vector": False,
+    })
+    found = {point["id"]: checkpoints.public_checkpoint(point) for point in result.get("result") or []}
+    return {"checkpoints": [found.get(point_id) for point_id in ids]}
+
+
+@app.post("/internal/checkpoints/claim", include_in_schema=False)
+async def checkpoint_claim(req: checkpoints.CheckpointClaimRequest) -> dict:
+    await _require_checkpoint_mutations()
+    return await checkpoints.claim_checkpoint(
+        _checkpoint_qdrant, COLLECTION, EMBED_DIM, CHECKPOINT_LEASE_SECONDS, req,
+    )
+
+
+@app.post("/internal/checkpoints/renew", include_in_schema=False)
+async def checkpoint_renew(req: checkpoints.CheckpointRenewRequest) -> dict:
+    await _require_checkpoint_mutations()
+    return await checkpoints.renew_checkpoint(
+        _checkpoint_qdrant, COLLECTION, EMBED_DIM, CHECKPOINT_LEASE_SECONDS, req,
+    )
+
+
+@app.post("/internal/checkpoints/complete", include_in_schema=False)
+async def checkpoint_complete(req: checkpoints.CheckpointCompleteRequest) -> dict:
+    await _require_checkpoint_mutations()
+    return await checkpoints.complete_checkpoint(_checkpoint_qdrant, COLLECTION, EMBED_DIM, req)
+
+
+@app.post("/internal/checkpoints/fail", include_in_schema=False)
+async def checkpoint_fail(req: checkpoints.CheckpointFailRequest) -> dict:
+    await _require_checkpoint_mutations()
+    return await checkpoints.fail_checkpoint(_checkpoint_qdrant, COLLECTION, EMBED_DIM, req)
+
+
+@app.post("/internal/checkpoints/due", include_in_schema=False)
+async def checkpoint_due(req: checkpoints.CheckpointDueRequest) -> dict:
+    return await checkpoints.due_checkpoints(_qdrant, COLLECTION, req)

@@ -222,7 +222,9 @@ class TestReadPolicy(unittest.IsolatedAsyncioTestCase):
             return {"result": [stored]}
         with patch.object(api, "_memory_enabled", new_callable=AsyncMock, return_value=False), patch.object(
                 api, "_qdrant", side_effect=qdrant), patch.object(api, "_embed", new_callable=AsyncMock, return_value=[0.0]):
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url="http://test") as client:
+            async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=api.app), base_url="http://test",
+                    headers={"Authorization": f"Bearer {os.environ['MEMORY_INTERNAL_TOKEN']}"}) as client:
                 for suffix in ("entries", "entries/" + ref, "profile", "keys", "entries/" + ref + "/history"):
                     response = await client.get("/memory/farmer/" + suffix)
                     self.assertEqual(response.status_code, 200)
@@ -267,7 +269,9 @@ class TestPublicBoundaries(unittest.IsolatedAsyncioTestCase):
             return {"result": [point]}
         with patch.object(api, "_memory_enabled", new_callable=AsyncMock, return_value=True), patch.object(
                 api, "_qdrant", side_effect=qdrant), patch.object(api, "_embed", new_callable=AsyncMock, return_value=[0.0]):
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url="http://test") as client:
+            async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=api.app), base_url="http://test",
+                    headers={"Authorization": f"Bearer {os.environ['MEMORY_INTERNAL_TOKEN']}"}) as client:
                 for path, key in (("entries?include_private=true", "entries"), ("entries/old?include_private=true", "entry")):
                     response = await client.get("/memory/test-farmer/" + path)
                     value = response.json()[key]
@@ -282,7 +286,9 @@ class TestPublicBoundaries(unittest.IsolatedAsyncioTestCase):
     async def test_post_cannot_invent_history_links(self):
         import httpx
         with patch.object(api, "_qdrant", new_callable=AsyncMock) as q:
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url="http://test") as client:
+            async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=api.app), base_url="http://test",
+                    headers={"Authorization": f"Bearer {os.environ['MEMORY_INTERNAL_TOKEN']}"}) as client:
                 response = await client.post("/memory/test-farmer/entries", json={
                     "headline": "A new memory", "previous_version": "another-farmers-entry"})
                 self.assertEqual(response.status_code, 422)
