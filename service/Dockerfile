@@ -10,7 +10,7 @@ ENV PYTHONUNBUFFERED=1
 RUN pip install --no-cache-dir fastapi==0.115.0 "uvicorn[standard]==0.30.6" httpx==0.27.2 pydantic==2.9.2 python-dotenv==1.0.1
 
 COPY memory_api.py /app/memory_api.py
-COPY profile_schema.py profile_fields.json episode.py runtime_config.py /app/
+COPY profile_schema.py profile_fields.json episode.py runtime_config.py checkpoints.py /app/
 
 EXPOSE 8100
 

@@ -11,9 +11,11 @@ an install before it runs is a test suite nobody runs.
 
     python3 -m unittest discover -s tests -v      (from the repo root)
 """
+import asyncio
 import os
 import sys
 import unittest
+from unittest.mock import AsyncMock, patch
 import env_fixture
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dreamer"))
@@ -199,6 +201,15 @@ class TestFarmerFilter(unittest.TestCase):
         excluded = {c["match"]["value"] for c in flt["must_not"]}
         self.assertIn(self.api.SETTINGS_TYPE, excluded)
         self.assertIn(self.api.PROFILE_TYPE, excluded)
+        self.assertIn(self.api.WORKER_CHECKPOINT_TYPE, excluded)
+
+    def test_embedding_model_detection_excludes_checkpoints(self):
+        with patch.object(self.api, "_qdrant", new_callable=AsyncMock,
+                          return_value={"result": {"points": []}}) as qdrant:
+            self.assertIsNone(asyncio.run(self.api._collection_embed_model()))
+        query = qdrant.call_args.args[2]
+        excluded = {row["match"]["value"] for row in query["filter"]["must_not"]}
+        self.assertIn(self.api.WORKER_CHECKPOINT_TYPE, excluded)
 
     def test_status_accepts_a_list(self):
         flt = self.api._farmer_filter("F1", status=["open", "pending"])

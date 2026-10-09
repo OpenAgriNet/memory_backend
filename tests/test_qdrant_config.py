@@ -50,5 +50,9 @@ class TestQdrantConnection(unittest.TestCase):
         self.assertTrue(any(method == "PUT" for method, _ in calls))
         self.assertTrue(all(key == "test-key" for _, key in calls))
 
-    def test_existing_collection_is_not_mutated(self):
-        self.assertEqual(self.exercise_startup(200), [("GET", "test-key")])
+    def test_existing_collection_gets_required_indexes_without_recreation(self):
+        calls = self.exercise_startup(200)
+        self.assertEqual(calls[0], ("GET", "test-key"))
+        self.assertEqual(len(calls), 13)  # collection check plus twelve idempotent indexes
+        self.assertTrue(all(method == "PUT" for method, _ in calls[1:]))
+        self.assertTrue(all(key == "test-key" for _, key in calls))

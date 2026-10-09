@@ -51,7 +51,7 @@ import os
 import re
 import sys
 
-import requests
+import memory_client as requests
 
 import agent
 import dates

@@ -27,3 +27,8 @@ def qdrant_headers(url=None):
     if (target.scheme, target.netloc) != (configured.scheme, configured.netloc):
         return {}
     return {"api-key": key}
+
+
+def memory_api_headers():
+    """Authentication shared by every first-party memory-service client."""
+    return {"Authorization": f"Bearer {required('MEMORY_INTERNAL_TOKEN')}"}

@@ -108,7 +108,11 @@ class TestQdrantChunks(unittest.IsolatedAsyncioTestCase):
         for p in self.patches:
             p.start()
         await api._ensure_collection()
-        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url="http://test")
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api.app),
+            base_url="http://test",
+            headers={"Authorization": f"Bearer {os.environ['MEMORY_INTERNAL_TOKEN']}"},
+        )
 
     async def asyncTearDown(self):
         await self.client.aclose()
