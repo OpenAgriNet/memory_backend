@@ -158,6 +158,26 @@ The default is the tool-using agent. `--pipeline` retains the older baseline for
 comparison; it is not an automatic fallback. Credentials are resolved at runtime,
 never copied into memory or these docs. Langfuse access is read-only.
 
+### Queue worker boundary
+
+New background orchestration must adapt source telemetry into the normalized
+`dreamer.tasks.MemoryTask` contract before enqueueing it. The queue worker never
+reads Langfuse field names directly. A task contains one farmer/session,
+chronological turns, a source label, and a schema version. It derives opaque task
+and subject keys for idempotency and safe logging without exposing farmer IDs or
+conversation text.
+
+`dreamer.queue_worker.consume_one` defines the broker boundary: receive,
+acknowledge, retry, and dead-letter. It acknowledges only after processing
+succeeds. The concrete queue provider and session-closing telemetry adapter are
+separate work; changing trace names or metadata must not change extraction or
+storage code.
+
+Delivery is at-least-once. A task can be delivered again after writes succeed but
+before acknowledgement, so the future processor must use the task key and source
+trace IDs for idempotency. Retry and dead-letter reasons contain only fixed error
+codes or exception class names, never exception text or task payloads.
+
 ## Verification
 
 Offline, with no service/model calls:
@@ -166,6 +186,7 @@ Offline, with no service/model calls:
 python3 -m unittest discover -s tests -p 'test_unit.py'
 python3 -m unittest discover -s tests -p 'test_review_regressions.py'
 python3 -m unittest discover -s tests -p 'test_bot_tools.py'
+python3 -m unittest discover -s tests -p 'test_queue_worker.py'
 ```
 
 `tests/test_service.py` writes synthetic records only when `AMUL_MEMORY_INTEGRATION=1`.
