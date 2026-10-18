@@ -7,7 +7,10 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dreamer"))
 
 from queue_worker import PermanentTaskError, QueueMessage, RetryableTaskError, consume_one  # noqa: E402
-from tasks import MemoryTask, TaskValidationError  # noqa: E402
+from tasks import (  # noqa: E402
+    MAX_ANSWER_CHARS, MAX_QUERY_CHARS, MAX_SESSION_ID_CHARS, MAX_SOURCE_CHARS,
+    MAX_TRACE_ID_CHARS, MAX_TURNS, MemoryTask, TaskValidationError,
+)
 
 
 def task_body():
@@ -70,6 +73,56 @@ class TestMemoryTask(unittest.TestCase):
         self.assertNotEqual(first.task_key, second.task_key)
         self.assertEqual(first.subject_key, second.subject_key)
 
+    def test_timestamps_are_canonical_before_hashing(self):
+        variants = []
+        for timestamp in ("2026-10-17T08:00:00Z", "2026-10-17T08:00:00+00:00",
+                          "2026-10-17T13:30:00+05:30"):
+            body = task_body()
+            body["turns"][0]["timestamp"] = timestamp
+            variants.append(MemoryTask.from_dict(body))
+        self.assertEqual({task.task_key for task in variants}, {variants[0].task_key})
+        self.assertTrue(all(task.turns[0].timestamp == "2026-10-17T08:00:00Z" for task in variants))
+
+    def test_identity_source_and_field_limits(self):
+        body = task_body()
+        body.update(session_id="s" * MAX_SESSION_ID_CHARS, source="s" * MAX_SOURCE_CHARS)
+        body["turns"][0].update(trace_id="t" * MAX_TRACE_ID_CHARS,
+                                query="q" * MAX_QUERY_CHARS,
+                                answer="a" * MAX_ANSWER_CHARS)
+        MemoryTask.from_dict(body)
+        invalid = (
+            ("farmer_id", " 9876543210"), ("farmer_id", "anonymous"),
+            ("farmer_id", "../9876543210"), ("farmer_id", "98765432101"),
+            ("session_id", "s" * (MAX_SESSION_ID_CHARS + 1)),
+            ("source", "https://user:secret@example.test"),
+            ("source", "ok\ncredential"), ("source", "s" * (MAX_SOURCE_CHARS + 1)),
+        )
+        for field, value in invalid:
+            changed = task_body()
+            changed[field] = value
+            with self.subTest(field=field, value=value[:20]), self.assertRaises(TaskValidationError):
+                MemoryTask.from_dict(changed)
+
+    def test_turn_count_and_payload_limits(self):
+        body = task_body()
+        template = body["turns"][0]
+        body["turns"] = [dict(template, trace_id=f"t-{index}",
+                              timestamp=f"2026-10-17T08:{index // 60:02d}:{index % 60:02d}Z",
+                              query="q", answer="a") for index in range(MAX_TURNS)]
+        MemoryTask.from_dict(body)
+        body["turns"].append(dict(body["turns"][-1], trace_id="too-many"))
+        with self.assertRaisesRegex(TaskValidationError, "invalid_turn_count"):
+            MemoryTask.from_dict(body)
+
+        oversized = task_body()
+        template = oversized["turns"][0]
+        oversized["turns"] = [dict(template, trace_id=f"large-{index}",
+                                          timestamp=f"2026-10-17T08:0{index}:00Z",
+                                          query="q", answer="🐄" * MAX_ANSWER_CHARS)
+                              for index in range(8)]
+        with self.assertRaisesRegex(TaskValidationError, "task_too_large"):
+            MemoryTask.from_dict(oversized)
+
     def test_rejects_malformed_tasks(self):
         def extra(body):
             body["telemetry_metadata"] = {}
@@ -102,6 +155,13 @@ class TestMemoryTask(unittest.TestCase):
             with self.subTest(code=code), self.assertRaises(TaskValidationError) as caught:
                 MemoryTask.from_dict(body)
             self.assertEqual(caught.exception.code, code)
+
+    def test_redacted_summary_never_emits_source(self):
+        body = task_body()
+        body["source"] = "credential-like-source"
+        summary = str(MemoryTask.from_dict(body).redacted_summary())
+        self.assertNotIn(body["source"], summary)
+        self.assertIn("source_key", summary)
 
 
 class TestConsumer(unittest.TestCase):
