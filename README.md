@@ -158,6 +158,49 @@ The default is the tool-using agent. `--pipeline` retains the older baseline for
 comparison; it is not an automatic fallback. Credentials are resolved at runtime,
 never copied into memory or these docs. Langfuse access is read-only.
 
+### Queue worker boundary
+
+New background orchestration must adapt source telemetry into the normalized
+`dreamer.tasks.MemoryTask` contract before enqueueing it. The queue worker never
+reads Langfuse field names directly. A task contains one farmer/session,
+chronological turns, a source label, and a schema version. It derives opaque task
+and subject keys for idempotency and safe logging without exposing farmer IDs or
+conversation text.
+
+The contract accepts only an authenticated canonical 10-digit farmer mobile. It
+does not trim or repair identities and rejects anonymous, path-like, oversized, or
+otherwise invalid values. A future telemetry adapter must derive that value only
+from authenticated claims, require JWT `user_type=farmer`, and exclude doctor and
+anonymous turns. It must never copy request-controlled `user_id`, `sub`, or a
+fallback identity into `farmer_id`.
+
+Tasks are bounded before model work: at most 256 KiB of canonical UTF-8 JSON, 100
+turns, 8,000 query characters, 16,000 answer characters, and 128,000 aggregate
+query/answer characters. Session and trace identifiers are bounded to 200 safe
+identifier characters; source labels are allowlisted and bounded to 64. Timestamps
+are normalized to UTC before keys are calculated. Log summaries hash the source
+label rather than emitting it.
+
+`dreamer.queue_worker.consume_one` defines the broker boundary: receive,
+acknowledge, retry, and dead-letter. It acknowledges only after processing
+succeeds. The concrete queue provider and session-closing telemetry adapter are
+separate work; changing trace names or metadata must not change extraction or
+storage code.
+
+Telemetry discovery remains a later producer PR. That PR must inspect the then-live
+`amul-oan-api/main` contract rather than assume field names. It owns current
+root-turn mapping, farmer-only eligibility, authenticated identity extraction,
+session-close policy, periodic scans, the concrete queue/visibility timeout/retry
+and DLQ policy, allowlisted dry-run/replay rollout, and zero-eligible/failure alerts.
+Per-phone erasure, restricted read-only bot Qdrant credentials, worker image,
+schedule, and deployment configuration are also later integration/deployment work;
+they are not implemented by this queue boundary.
+
+Delivery is at-least-once. A task can be delivered again after writes succeed but
+before acknowledgement, so the future processor must use the task key and source
+trace IDs for idempotency. Retry and dead-letter reasons contain only fixed error
+codes or exception class names, never exception text or task payloads.
+
 ## Verification
 
 Offline, with no service/model calls:
@@ -166,6 +209,7 @@ Offline, with no service/model calls:
 python3 -m unittest discover -s tests -p 'test_unit.py'
 python3 -m unittest discover -s tests -p 'test_review_regressions.py'
 python3 -m unittest discover -s tests -p 'test_bot_tools.py'
+python3 -m unittest discover -s tests -p 'test_queue_worker.py'
 ```
 
 `tests/test_service.py` writes synthetic records only when `AMUL_MEMORY_INTEGRATION=1`.
