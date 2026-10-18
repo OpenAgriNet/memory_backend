@@ -163,8 +163,9 @@ def process_task(
     try:
         state_store.complete(task, outcome, fingerprints)
     except Exception as exc:
-        disposition: FailureDisposition = "needs_review" if mutation_attempted or writes else "retryable"
+        uncertain = mutation_attempted or bool(writes)
+        disposition: FailureDisposition = "needs_review" if uncertain else "retryable"
         _record_failure(state_store, task, disposition)
-        error_type = PermanentTaskError if mutation_attempted else RetryableTaskError
+        error_type = PermanentTaskError if uncertain else RetryableTaskError
         raise error_type("task_completion_uncertain") from exc
     return ProcessResult(outcome, processed_chunks=len(chunks), writes=writes)
