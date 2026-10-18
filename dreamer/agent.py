@@ -92,6 +92,8 @@ def _run_tools(ctx, calls):
             for (i, _), res in zip(reads, pool.map(lambda ic: call(ic[1]), reads)):
                 results[i] = res
     for i, c in writes:
+        if c["name"] != "nothing_to_remember":
+            ctx.mutation_attempted = True
         results[i] = call(c)
     return results
 
@@ -126,11 +128,15 @@ TURNS:
         try:
             msg = llm.chat(messages, tools=tools.SCHEMAS, max_tokens=1500)
         except Exception as exc:  # noqa: BLE001
-            print(f"  ! agent step failed ({exc}); stopping this chunk", file=sys.stderr)
+            ctx.error_code = "agent_model_failed"
+            if verbose:
+                print(f"  ! agent step failed ({exc}); stopping this chunk", file=sys.stderr)
             break
 
         raw_calls = getattr(msg, "tool_calls", None) or []
         if not raw_calls:
+            if not ctx.writes and not ctx.blocked:
+                ctx.error_code = "agent_stopped_without_outcome"
             if verbose and (msg.content or "").strip():
                 print(f"      agent: {(msg.content or '').strip()[:160]}")
             break
@@ -174,6 +180,7 @@ TURNS:
                     for why in res.get("reasons") or []:
                         print(f"        REFUSED: {why[:130]}")
     else:
+        ctx.error_code = "agent_step_budget_exhausted"
         if verbose:
             print(f"      (hit the {MAX_STEPS}-step budget)")
 

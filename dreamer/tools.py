@@ -41,6 +41,10 @@ class Ctx:
         self.trace_ids = list(trace_ids or [t.get("trace_id") for t in (turns or [])])
         self.writes: list[dict] = []      # what actually happened, for the caller
         self.blocked: list[dict] = []     # what the judges refused, and why
+        # Worker-only outcome signals.  They contain no exception text, and leave
+        # the existing command-line reporting unchanged.
+        self.error_code: str | None = None
+        self.mutation_attempted = False
         self.seen_headlines: set[str] = set()  # idempotency within one agent run
         self.refusals: dict[str, int] = {}     # per-entry refusal count, to stop retry loops
 

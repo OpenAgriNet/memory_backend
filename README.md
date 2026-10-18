@@ -27,6 +27,8 @@ and model endpoints. `.env` is ignored by git; process environment takes precede
 - `QDRANT_API_KEY`: sent as `api-key` on Qdrant requests; leave empty only for an
   unauthenticated local instance. It is not sent to the embedding/model services.
 - `QDRANT_COLLECTION`: collection used by the memory service and repair commands.
+- `QDRANT_TASK_STATE_COLLECTION`: separate hash-only worker progress collection.
+  It requires Qdrant 1.17+ and must not be set to `QDRANT_COLLECTION`.
 - `MARQO_URL`, `MARQO_INDEX`, `EMBED_DIM`: embedding service and vector configuration.
 - `DREAMER_BASE_URL`, `DREAMER_MODEL`: configured OpenAI-compatible model endpoint.
 - `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`: the source
@@ -77,6 +79,12 @@ off and failed flag reads suppress reply memory. Background learning can continu
 internal reads without changing that flag. Keep the service's writes and internal
 routes restricted to trusted callers; the service itself does not implement end-user
 authentication.
+
+Queue tasks are normalized before they reach the worker. `process_task` handles one
+session at a time and records only hashed progress in `QDRANT_TASK_STATE_COLLECTION`.
+There is deliberately no lease, renewal loop, retry schedule, telemetry reader, or
+session-closure policy here. The queue owns retry timing; an unfinished task that may
+have written memory is sent for review rather than replayed automatically.
 
 The background agent proposes changes through `writer.apply`. Failed or malformed
 checks retry once, then block saving and report the proposal for retry. The standing
