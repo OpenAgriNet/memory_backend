@@ -27,6 +27,8 @@ and model endpoints. `.env` is ignored by git; process environment takes precede
 - `QDRANT_API_KEY`: sent as `api-key` on Qdrant requests; leave empty only for an
   unauthenticated local instance. It is not sent to the embedding/model services.
 - `QDRANT_COLLECTION`: collection used by the memory service and repair commands.
+- `QDRANT_TASK_STATE_COLLECTION`: separate hash-only worker progress collection.
+  It requires Qdrant 1.17+ and must not be set to `QDRANT_COLLECTION`.
 - `MARQO_URL`, `MARQO_INDEX`, `EMBED_DIM`: embedding service and vector configuration.
 - `DREAMER_BASE_URL`, `DREAMER_MODEL`: configured OpenAI-compatible model endpoint.
 - `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`: the source
@@ -74,9 +76,27 @@ mandatory taxonomy. Unknown fields are omitted/reported; bounds are enforced.
 Only the administrative settings endpoint writes the separate Qdrant reply-use flag.
 The global bot switch defaults off. Per-farmer settings currently default on; explicit
 off and failed flag reads suppress reply memory. Background learning can continue via
-internal reads without changing that flag. Keep the service's writes and internal
-routes restricted to trusted callers; the service itself does not implement end-user
-authentication.
+internal reads without changing that flag, but every farmer-memory write, update,
+fold, re-index, and profile update fails closed while memory is disabled or its
+setting cannot be checked. The worker checks the same setting before invoking the
+model. Keep the service's writes and internal routes restricted to trusted callers;
+the service itself does not implement end-user authentication.
+
+Queue tasks are normalized before they reach the worker. `process_task` handles one
+session at a time and records only hashed progress in `QDRANT_TASK_STATE_COLLECTION`.
+Claims persist a lease owner and expiry. Active leases defer redelivery; an expired
+claim can be taken over only when no write tool had started. A crash after write work
+started becomes `needs_review`, and replay requires the explicit
+`administrative_recover(..., replay_confirmed_safe=True)` path after inspection.
+There is deliberately no renewal thread or retry schedule here; the queue owns retry
+timing.
+
+Source turns are immutable. Reusing a trace ID with changed content sends the task to
+review; it is never checkpointed as a successful correction. Previously processed
+turns are not replayed as writable evidence: late arrivals are passed to the model by
+themselves in chronological pending-only chunks. `python -m dreamer.worker <task.json>`
+is the supported one-task composition for local/integration use; a later producer PR
+supplies the real broker adapter and telemetry/session discovery.
 
 The background agent proposes changes through `writer.apply`. Failed or malformed
 checks retry once, then block saving and report the proposal for retry. The standing

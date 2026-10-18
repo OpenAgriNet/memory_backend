@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dreamer"))
 
 from queue_worker import PermanentTaskError, QueueMessage, RetryableTaskError, consume_one  # noqa: E402
 from tasks import (  # noqa: E402
-    MAX_ANSWER_CHARS, MAX_QUERY_CHARS, MAX_SESSION_ID_CHARS, MAX_SOURCE_CHARS,
+    MAX_ANSWER_CHARS, MAX_CONTENT_CHARS, MAX_QUERY_CHARS, MAX_SESSION_ID_CHARS, MAX_SOURCE_CHARS,
     MAX_TRACE_ID_CHARS, MAX_TURNS, MemoryTask, TaskValidationError,
 )
 
@@ -102,6 +102,15 @@ class TestMemoryTask(unittest.TestCase):
             changed[field] = value
             with self.subTest(field=field, value=value[:20]), self.assertRaises(TaskValidationError):
                 MemoryTask.from_dict(changed)
+        for field, value in (
+            ("trace_id", "t" * (MAX_TRACE_ID_CHARS + 1)),
+            ("query", "q" * (MAX_QUERY_CHARS + 1)),
+            ("answer", "a" * (MAX_ANSWER_CHARS + 1)),
+        ):
+            changed = task_body()
+            changed["turns"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(TaskValidationError):
+                MemoryTask.from_dict(changed)
 
     def test_turn_count_and_payload_limits(self):
         body = task_body()
@@ -113,6 +122,18 @@ class TestMemoryTask(unittest.TestCase):
         body["turns"].append(dict(body["turns"][-1], trace_id="too-many"))
         with self.assertRaisesRegex(TaskValidationError, "invalid_turn_count"):
             MemoryTask.from_dict(body)
+
+        aggregate = task_body()
+        template = aggregate["turns"][0]
+        per_answer = (MAX_CONTENT_CHARS // 8) - 1
+        aggregate["turns"] = [dict(template, trace_id=f"aggregate-{index}",
+                                         timestamp=f"2026-10-17T08:0{index}:00Z",
+                                         query="q", answer="a" * per_answer)
+                              for index in range(8)]
+        MemoryTask.from_dict(aggregate)
+        aggregate["turns"][-1]["answer"] += "a"
+        with self.assertRaisesRegex(TaskValidationError, "task_content_too_large"):
+            MemoryTask.from_dict(aggregate)
 
         oversized = task_body()
         template = oversized["turns"][0]
