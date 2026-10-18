@@ -27,9 +27,12 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import sys
 
-import llm
-import prompts
-import tools
+if __package__:
+    from . import llm, prompts, tools
+else:
+    import llm
+    import prompts
+    import tools
 
 MAX_STEPS = int(__import__("os").environ.get("DREAMER_AGENT_STEPS", "8"))
 
@@ -79,32 +82,45 @@ def _run_tools(ctx, calls):
     def call(c):
         fn = tools.IMPL.get(c["name"])
         if not fn:
-            return {"error": f"no such tool: {c['name']}"}
+            ctx.tool_failures.append("unknown_tool")
+            return {"error": "unknown_tool"}
         try:
-            return fn(ctx, **c["args"])
-        except TypeError as exc:
-            return {"error": f"bad arguments: {exc}"}
-        except Exception as exc:  # noqa: BLE001
-            return {"error": f"{type(exc).__name__}: {exc}"}
+            if c["name"] not in tools.READ_ONLY and c["name"] != "nothing_to_remember":
+                ctx.start_mutation()
+            result = fn(ctx, **c["args"])
+            if isinstance(result, dict) and result.get("error"):
+                ctx.tool_failures.append("tool_returned_error")
+                if c["name"] not in tools.READ_ONLY and c["name"] != "nothing_to_remember":
+                    ctx.uncertain_mutation = True
+            return result
+        except TypeError:
+            ctx.tool_failures.append("invalid_tool_arguments")
+            if c["name"] not in tools.READ_ONLY and c["name"] != "nothing_to_remember" and ctx._mutation_started:
+                ctx.uncertain_mutation = True
+            return {"error": "invalid_tool_arguments"}
+        except Exception:  # noqa: BLE001
+            ctx.tool_failures.append("tool_exception")
+            if c["name"] not in tools.READ_ONLY and c["name"] != "nothing_to_remember" and ctx._mutation_started:
+                ctx.uncertain_mutation = True
+            return {"error": "tool_exception"}
 
     if reads:
         with ThreadPoolExecutor(max_workers=min(len(reads), 6)) as pool:
             for (i, _), res in zip(reads, pool.map(lambda ic: call(ic[1]), reads)):
                 results[i] = res
     for i, c in writes:
-        if c["name"] != "nothing_to_remember":
-            ctx.mutation_attempted = True
         results[i] = call(c)
     return results
 
 
 def dream(api, farmer_id, turns, *, source_ts=None, session_id=None,
-          known_keys=(), dry_run=False, verbose=True, trace_ids=None):
+          known_keys=(), dry_run=False, verbose=True, trace_ids=None,
+          before_mutation=None):
     """Run the agent over one chunk of turns. Returns the Ctx, which records
     everything written and everything the judges refused."""
     ctx = tools.Ctx(api, farmer_id, turns=turns, source_ts=source_ts,
                     session_id=session_id, known_keys=known_keys, dry_run=dry_run,
-                    trace_ids=trace_ids)
+                    trace_ids=trace_ids, before_mutation=before_mutation)
 
     convo = "\n\n".join(
         f"Turn {n} [{(t.get('ts') or '')[:10]}] FARMER: {t['query']}\nASSISTANT: {t.get('answer') or ''}"
@@ -184,4 +200,6 @@ TURNS:
         if verbose:
             print(f"      (hit the {MAX_STEPS}-step budget)")
 
+    if ctx.tool_failures:
+        ctx.error_code = "agent_tool_failure"
     return ctx

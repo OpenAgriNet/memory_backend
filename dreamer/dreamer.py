@@ -53,14 +53,18 @@ import sys
 
 import requests
 
-import agent
-import dates
-import lf
-import llm
-import prompts
-import tools
-import writer
-from runtime_config import required
+if __package__:
+    from . import agent, dates, lf, llm, prompts, tools, writer
+    from service.runtime_config import required
+else:
+    import agent
+    import dates
+    import lf
+    import llm
+    import prompts
+    import tools
+    import writer
+    from runtime_config import required
 
 MEMORY_API = required("MEMORY_API_URL").rstrip("/")
 MATCH_CANDIDATES = int(os.environ.get("DREAMER_MATCH_CANDIDATES", "5"))

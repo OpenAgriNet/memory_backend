@@ -47,9 +47,13 @@ from typing import Annotated, Any, Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
-import profile_schema
-import episode
-from runtime_config import required, qdrant_headers
+if __package__:
+    from . import episode, profile_schema
+    from .runtime_config import required, qdrant_headers
+else:
+    import profile_schema
+    import episode
+    from runtime_config import required, qdrant_headers
 
 QDRANT_URL = required("QDRANT_URL").rstrip("/")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "amul_memory")

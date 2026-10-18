@@ -19,7 +19,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
-from runtime_config import required
+if __package__:
+    from service.runtime_config import required
+else:
+    from runtime_config import required
 
 from openai import OpenAI
 

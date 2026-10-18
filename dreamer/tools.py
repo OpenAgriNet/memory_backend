@@ -19,15 +19,18 @@ from copy import copy
 
 import requests
 
-import dates
-import writer
+if __package__:
+    from . import dates, writer
+else:
+    import dates
+    import writer
 
 
 class Ctx:
     """What the agent is working on. Not visible to the model."""
 
     def __init__(self, api, farmer_id, turns=None, source_ts=None, session_id=None,
-                 known_keys=(), dry_run=False, trace_ids=None):
+                 known_keys=(), dry_run=False, trace_ids=None, before_mutation=None):
         self.api = api.rstrip("/")
         self.farmer_id = str(farmer_id)
         self.turns = turns or []
@@ -45,8 +48,21 @@ class Ctx:
         # the existing command-line reporting unchanged.
         self.error_code: str | None = None
         self.mutation_attempted = False
+        self.uncertain_mutation = False
+        self.tool_failures: list[str] = []
+        self.before_mutation = before_mutation
+        self._mutation_started = False
         self.seen_headlines: set[str] = set()  # idempotency within one agent run
         self.refusals: dict[str, int] = {}     # per-entry refusal count, to stop retry loops
+
+    def start_mutation(self) -> None:
+        """Persist uncertainty before the first tool can mutate farmer memory."""
+        if self._mutation_started:
+            return
+        if self.before_mutation is not None:
+            self.before_mutation()
+        self._mutation_started = True
+        self.mutation_attempted = True
 
     def for_sources(self, numbers):
         """Keep shared run bookkeeping, but restrict evidence to selected turns."""
@@ -197,6 +213,8 @@ def document_key(ctx: Ctx, key: str, description: str) -> dict:
 
 def nothing_to_remember(ctx: Ctx, why: str) -> dict:
     """Record why these turns add no useful supported memory."""
+    if ctx.tool_failures:
+        return {"acknowledged": False, "error": "earlier_tool_failure"}
     ctx.writes.append({"action": "nothing", "notes": [why]})
     return {"acknowledged": True, "notes": [why]}
 
