@@ -37,6 +37,7 @@ Scope: this service creates and updates memory in Qdrant. That is all it does. I
 does no ranking beyond Qdrant's own vector search, no reasoning, and no scheduling.
 """
 import os
+import hmac
 import json
 import math
 import re
@@ -45,18 +46,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 if __package__:
     from . import episode, profile_schema
-    from .runtime_config import required, qdrant_headers
+    from .runtime_config import bearer_token_is_safe, memory_internal_token, required, qdrant_headers
 else:
     import profile_schema
     import episode
-    from runtime_config import required, qdrant_headers
+    from runtime_config import bearer_token_is_safe, memory_internal_token, required, qdrant_headers
 
 QDRANT_URL = required("QDRANT_URL").rstrip("/")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "amul_memory")
+MEMORY_INTERNAL_TOKEN = memory_internal_token()
 
 # ---------- embeddings ----------
 # Qdrant searches vectors but does not create them, so one external call is
@@ -112,6 +115,32 @@ AGENT_HIDDEN_KEYS = {"animal_id", "account_no", "account_number", "transaction_i
 DEFAULT_MEMORY_ENABLED = True
 
 app = FastAPI(title="Amul memory API (test harness)")
+
+
+@app.middleware("http")
+async def _authenticate(request: Request, call_next):
+    """Protect every route except the two public health-check methods."""
+    if request.url.path == "/health" and request.method in {"GET", "HEAD"}:
+        return await call_next(request)
+
+    authorization = request.headers.get("Authorization", "")
+    scheme, separator, supplied = authorization.partition(" ")
+    supplied_is_safe = (
+        bool(separator)
+        and scheme.lower() == "bearer"
+        and bool(supplied)
+        and bearer_token_is_safe(supplied)
+    )
+    valid = supplied_is_safe and hmac.compare_digest(
+        supplied.encode("ascii"), MEMORY_INTERNAL_TOKEN.encode("ascii")
+    )
+    if not valid:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return await call_next(request)
 
 
 # ---------- models ----------
@@ -521,6 +550,12 @@ async def health() -> dict:
         # with embed_model above, search results are meaningless — see _startup.
         "collection_embed_model": await _collection_embed_model(),
     }
+
+
+@app.head("/health", include_in_schema=False)
+async def health_head() -> Response:
+    await health()
+    return Response(status_code=200)
 
 
 @app.post("/memory/{farmer_id}/entries")

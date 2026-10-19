@@ -39,6 +39,10 @@ and model endpoints. `.env` is ignored by git; process environment takes precede
 - `MEMORY_API_URL`: private storage API called by the background job only. The bot
   uses `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_COLLECTION` and its existing
   `MARQO_ENDPOINT_URL`/`MARQO_INDEX_NAME` instead; see the bot's deployment guide.
+- `MEMORY_INTERNAL_TOKEN`: shared internal bearer token used by the Memory API and
+  Dreamer. Use a unique random bearer-safe ASCII value of at least 32 characters.
+  Store it in the deployment secret manager, not in source control.
+  Generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
 - `BACKTEST_API_URL`, `BACKTEST_COLLECTION`: isolated evaluation service and collection.
 
 Qdrant REST over HTTPS is sufficient; this implementation does not need gRPC.
@@ -79,8 +83,10 @@ off and failed flag reads suppress reply memory. Background learning can continu
 internal reads without changing that flag, but every farmer-memory write, update,
 fold, re-index, and profile update fails closed while memory is disabled or its
 setting cannot be checked. The worker checks the same setting before invoking the
-model. Keep the service's writes and internal routes restricted to trusted callers;
-the service itself does not implement end-user authentication.
+model. Every Memory API route requires
+`Authorization: Bearer <MEMORY_INTERNAL_TOKEN>` except public `GET /health` and
+`HEAD /health`. This is service-to-service authentication, not farmer login or JWT
+authentication. Keep network access restricted to trusted callers as a second layer.
 
 Queue tasks are normalized before they reach the worker. `process_task` handles one
 session at a time and records only hashed progress in `QDRANT_TASK_STATE_COLLECTION`.
