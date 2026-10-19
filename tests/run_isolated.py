@@ -31,6 +31,7 @@ try:
         QDRANT_URL=endpoint,
         QDRANT_API_KEY="",
         MEMORY_INTERNAL_TOKEN="isolated-test-token-32-characters-minimum",
+        MEMORY_ID_HASH_KEY="isolated-id-hash-key-32-characters-minimum",
     )
     result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_episode_chunks.py", "-v"],
                             cwd=Path(__file__).resolve().parents[1], env=env)
