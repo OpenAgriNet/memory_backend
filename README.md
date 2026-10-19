@@ -43,6 +43,9 @@ and model endpoints. `.env` is ignored by git; process environment takes precede
   Dreamer. Use a unique random bearer-safe ASCII value of at least 32 characters.
   Store it in the deployment secret manager, not in source control.
   Generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+- `MEMORY_ID_HASH_KEY`: separate stable secret used to HMAC farmer identity in task
+  state. Generate it the same way, store it as a deployment secret, and do not
+  rotate it without migrating or resetting the task-state collection.
 - `BACKTEST_API_URL`, `BACKTEST_COLLECTION`: isolated evaluation service and collection.
 
 Qdrant REST over HTTPS is sufficient; this implementation does not need gRPC.
@@ -251,14 +254,31 @@ but still contains a request-value fallback. The adapter cannot prove which bran
 produced an old trace. The matching and phone checks reduce accidental mixing, but
 this limitation must be reviewed before a broad real-data rollout.
 
-Per-phone erasure, restricted read-only bot Qdrant credentials, worker image,
-schedule, deployment configuration, replay approval, cost measurement, and alert
-rules remain later integration/deployment work.
+Restricted read-only bot Qdrant credentials, worker image, schedule, deployment
+configuration, replay approval, cost measurement, and alert rules remain later
+integration/deployment work.
 
 Delivery is at-least-once. A task can be delivered again after writes succeed but
 before acknowledgement, so the future processor must use the task key and source
 trace IDs for idempotency. Retry and dead-letter reasons contain only fixed error
 codes or exception class names, never exception text or task payloads.
+
+### Per-phone erasure
+
+The operator command is read-only unless `--execute` is present:
+
+```bash
+python -m dreamer.erase_farmer --farmer-id 9876543210
+python -m dreamer.erase_farmer --farmer-id 9876543210 --execute \
+  --confirm-phone 9876543210 --workers-paused
+```
+
+Before execution, pause both the producer and worker. The command first retains an
+explicit `memory_enabled=false` settings tombstone, then removes that phone's memory
+points, HMAC-keyed task state, Redis stream/retry/dead-letter tasks, and related
+deduplication markers. It verifies the result and is safe to rerun after a partial
+failure. Output contains only the HMAC farmer key, counts, and fixed outcome fields.
+It never deletes source conversations from Langfuse.
 
 ## Verification
 

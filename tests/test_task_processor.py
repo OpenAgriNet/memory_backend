@@ -193,6 +193,8 @@ class TestLeases(unittest.TestCase):
     def test_state_contains_hashes_not_farmer_or_conversation(self):
         self.store().begin(task())
         stored = repr(self.backing)
+        payload = self.backing[task().subject_key]
+        self.assertRegex(payload["farmer_key"], r"^[0-9a-f]{64}$")
         for private in ("9876543210", "question 0", "answer 0", "trace-0"):
             self.assertNotIn(private, stored)
 
@@ -220,7 +222,10 @@ class TestComposition(unittest.TestCase):
                    MARQO_URL="http://127.0.0.1:1", DREAMER_BASE_URL="http://127.0.0.1:1",
                    MEMORY_API_URL="http://127.0.0.1:1")
         result = subprocess.run(
-            [sys.executable, "-c", "import dreamer.agent, dreamer.dreamer, dreamer.worker"],
+            [sys.executable, "-c", (
+                "import dreamer.agent, dreamer.dreamer, dreamer.erase_farmer, "
+                "dreamer.worker"
+            )],
             cwd=ROOT, env=env, capture_output=True, text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)

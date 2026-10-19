@@ -11,11 +11,13 @@ from urllib.parse import urlsplit
 import requests
 
 if __package__:
+    from .identity import farmer_key
     from .task_processor import (
         BeginResult, CompletionOutcome, FailureDisposition, ProcessedTurn,
     )
     from .tasks import MemoryTask
 else:
+    from identity import farmer_key
     from task_processor import BeginResult, CompletionOutcome, FailureDisposition, ProcessedTurn
     from tasks import MemoryTask
 
@@ -189,6 +191,7 @@ class QdrantTaskStateStore:
         owner = uuid.uuid4().hex
         payload = {
             "subject_key": task.subject_key,
+            "farmer_key": farmer_key(task.farmer_id),
             "task_key": task.task_key,
             "status": "processing",
             "write_state": "not_started",
