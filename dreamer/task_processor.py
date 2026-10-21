@@ -179,6 +179,14 @@ def process_task(
             _record_failure(state_store, task, "needs_review")
             raise PermanentTaskError("source_turn_changed")
 
+    all_processed_by_key = {
+        item.trace_key: item for item in begin.processed_turns
+    }
+    all_processed_by_key.update({item.trace_key: item for item in current})
+    all_processed = tuple(
+        all_processed_by_key[key] for key in sorted(all_processed_by_key)
+    )
+
     pending_keys = {
         item.trace_key for item in current if previous.get(item.trace_key) != item.fingerprint
     }
@@ -195,7 +203,7 @@ def process_task(
         raise RetryableTaskError("memory_setting_unavailable") from exc
     if not enabled:
         try:
-            state_store.complete(task, "no_op", current)
+            state_store.complete(task, "no_op", all_processed)
         except Exception as exc:
             _record_failure(state_store, task, "retryable")
             raise RetryableTaskError("task_completion_uncertain") from exc
@@ -204,7 +212,7 @@ def process_task(
     chunks = _session_chunks(pending_turns)
     if not chunks:
         try:
-            state_store.complete(task, "no_op", current)
+            state_store.complete(task, "no_op", all_processed)
         except Exception as exc:
             _record_failure(state_store, task, "retryable")
             raise RetryableTaskError("task_completion_uncertain") from exc
@@ -222,7 +230,7 @@ def process_task(
 
     outcome: CompletionOutcome = "completed" if writes else "no_op"
     try:
-        state_store.complete(task, outcome, current)
+        state_store.complete(task, outcome, all_processed)
     except Exception as exc:
         disposition: FailureDisposition = "needs_review" if writes else "retryable"
         _record_failure(state_store, task, disposition)

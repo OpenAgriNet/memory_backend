@@ -12,6 +12,9 @@ import requests
 from dotenv import dotenv_values
 
 CHAT_TRACE_NAME = "chat.translation"
+CHAT_SCHEMA_VERSION = "chat.turn.v1"
+TURN_TRACE_NAME = "turn"
+TURN_SCHEMA_VERSION = "turn.v1"
 
 
 class LangfuseRO:
@@ -45,6 +48,35 @@ class LangfuseRO:
             r.raise_for_status()
         raise RuntimeError(f"GET {path} failed after {retries} attempts")
 
+    def traces(self, start, stop, *, name=CHAT_TRACE_NAME, **filters):
+        """Read root traces for one UTC window, splitting costly queries safely."""
+        params = {
+            "name": name,
+            "fromTimestamp": iso(start),
+            "toTimestamp": iso(stop),
+            "limit": 100,
+            "fields": "core,io",
+            **filters,
+        }
+
+        rows, page = [], 1
+        try:
+            while True:
+                params["page"] = page
+                data = self._get("/api/public/traces", params)
+                items = data.get("data", [])
+                rows.extend(items)
+                if not items or page >= (data.get("meta", {}).get("totalPages") or 1):
+                    return rows
+                page += 1
+        except TimeoutError:
+            if stop - start <= dt.timedelta(hours=1):
+                raise
+            middle = start + (stop - start) / 2
+            return self.traces(start, middle, name=name, **filters) + self.traces(
+                middle, stop, name=name, **filters
+            )
+
     def farmer_turns(self, farmer_id, days_back=30, until=None):
         """Every chat turn for one farmer, oldest first.
 
@@ -57,25 +89,7 @@ class LangfuseRO:
         if end.tzinfo is None:
             end = end.replace(tzinfo=dt.timezone.utc)
         def read_window(start, stop):
-            params = {"userId": str(farmer_id), "name": CHAT_TRACE_NAME,
-                      "fromTimestamp": iso(start), "toTimestamp": iso(stop), "limit": 100,
-                      "fields": "core,io"}  # Avoid unrelated observation/score/metric joins.
-
-            rows, page = [], 1
-            try:
-                while True:
-                    params["page"] = page
-                    data = self._get("/api/public/traces", params)
-                    items = data.get("data", [])
-                    rows.extend(items)
-                    if not items or page >= (data.get("meta", {}).get("totalPages") or 1):
-                        return rows
-                    page += 1
-            except TimeoutError:
-                if stop - start <= dt.timedelta(hours=1):
-                    raise
-                middle = start + (stop - start) / 2
-                return read_window(start, middle) + read_window(middle, stop)
+            return self.traces(start, stop, userId=str(farmer_id))
 
         out = {}
         for t in read_window(end - dt.timedelta(days=days_back), end):

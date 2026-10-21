@@ -95,8 +95,8 @@ Source turns are immutable. Reusing a trace ID with changed content sends the ta
 review; it is never checkpointed as a successful correction. Previously processed
 turns are not replayed as writable evidence: late arrivals are passed to the model by
 themselves in chronological pending-only chunks. `python -m dreamer.worker <task.json>`
-is the supported one-task composition for local/integration use; a later producer PR
-supplies the real broker adapter and telemetry/session discovery.
+is the supported one-task composition for local/integration use. The closed-session
+producer and Redis Streams worker are described below.
 
 The background agent proposes changes through `writer.apply`. Failed or malformed
 checks retry once, then block saving and report the proposal for retry. The standing
@@ -187,12 +187,11 @@ chronological turns, a source label, and a schema version. It derives opaque tas
 and subject keys for idempotency and safe logging without exposing farmer IDs or
 conversation text.
 
-The contract accepts only an authenticated canonical 10-digit farmer mobile. It
-does not trim or repair identities and rejects anonymous, path-like, oversized, or
-otherwise invalid values. A future telemetry adapter must derive that value only
-from authenticated claims, require JWT `user_type=farmer`, and exclude doctor and
-anonymous turns. It must never copy request-controlled `user_id`, `sub`, or a
-fallback identity into `farmer_id`.
+The contract accepts only a canonical 10-digit farmer mobile. It does not trim or
+repair identities and rejects anonymous, path-like, oversized, or otherwise invalid
+values. The producer owns the trust decision before creating that task. The current
+adapter uses the fields available on main and applies the extra identity/persona
+matching described below; its remaining authentication limitation is explicit.
 
 Tasks are bounded before model work: at most 256 KiB of canonical UTF-8 JSON, 100
 turns, 8,000 query characters, 16,000 answer characters, and 128,000 aggregate
@@ -203,18 +202,58 @@ label rather than emitting it.
 
 `dreamer.queue_worker.consume_one` defines the broker boundary: receive,
 acknowledge, retry, and dead-letter. It acknowledges only after processing
-succeeds. The concrete queue provider and session-closing telemetry adapter are
-separate work; changing trace names or metadata must not change extraction or
-storage code.
+succeeds. `dreamer.redis_queue.RedisStreamTaskQueue` supplies the Redis Streams
+transport, including visibility recovery, bounded retries, deduplication, and a
+separate dead-letter stream. Retryable failures use a Redis sorted-set delay before
+returning to the stream. Changing trace names or metadata does not change extraction
+or storage code.
 
-Telemetry discovery remains a later producer PR. That PR must inspect the then-live
-`amul-oan-api/main` contract rather than assume field names. It owns current
-root-turn mapping, farmer-only eligibility, authenticated identity extraction,
-session-close policy, periodic scans, the concrete queue/visibility timeout/retry
-and DLQ policy, allowlisted dry-run/replay rollout, and zero-eligible/failure alerts.
+### Closed-session producer
+
+`python -m dreamer.producer` performs one scan. Add `--forever` to repeat every
+`MEMORY_SCAN_INTERVAL_SECONDS` (30 minutes by default). A session is closed after
+`MEMORY_SESSION_CLOSE_SECONDS` (40 minutes by default).
+
+The adapter matches two explicit `amul-oan-api` contracts. Chat uses root
+`chat.translation`, schema `chat.turn.v1`, matching trace/metadata identity,
+farmer persona, and the successful `turn_outcome` score. The adapter also accepts
+chat's new `turn` / `turn.v1` contract during the telemetry migration. Voice support depends on
+amul-oan-api PR #432: root `turn`, schema `turn.v1`, `amul.pipeline=telephony`, service
+`amul-oan-api`, `amul.signed_in=true`, a canonical `amul.farmer_id` matching the
+trace identity, full input/output text, and metadata outcome `success`. Missing or
+malformed voice fields fail closed; greetings, moderation rejections, stale or
+disconnected calls, consent-only replies, errors, anonymous calls, and legacy
+`voice-oan-api` traces never become evidence. The mapping stays isolated in
+`CurrentMainTelemetryAdapter`; the task, queue, and processor contracts are unchanged.
+
+Chat and voice are grouped independently by farmer, session and surface, and the
+dry-run summary reports only per-surface counts and fixed rejection reasons—never
+farmer IDs or conversation text. Sessions that exceed the task contract are split into chronological tasks. They
+keep the same farmer/session subject, and worker progress unions processed-turn
+fingerprints across fragments so no successful fragment is forgotten or replayed.
+
+Safe rollout is the default:
+
+- `MEMORY_PRODUCER_DRY_RUN=true` prevents queue writes.
+- `MEMORY_FARMER_ALLOWLIST_ENABLED=true` restricts eligibility to the comma-separated
+  canonical phones in `MEMORY_FARMER_ALLOWLIST`; an empty list selects nobody.
+- After the allowlisted test is accepted, set
+  `MEMORY_FARMER_ALLOWLIST_ENABLED=false` to remove the temporary restriction and
+  scan every eligible farmer. Keep the setting available as a rollback control.
+
+When dry-run is turned off, install `requirements-worker.txt`, set
+`MEMORY_REDIS_URL`, and run `python -m dreamer.redis_worker`. The worker processes
+one task at a time. Redis delivery is at-least-once; expired pending entries are
+reclaimed after the configured visibility interval.
+
+Current main prefers the authenticated JWT phone when setting telemetry `user_id`,
+but still contains a request-value fallback. The adapter cannot prove which branch
+produced an old trace. The matching and phone checks reduce accidental mixing, but
+this limitation must be reviewed before a broad real-data rollout.
+
 Per-phone erasure, restricted read-only bot Qdrant credentials, worker image,
-schedule, and deployment configuration are also later integration/deployment work;
-they are not implemented by this queue boundary.
+schedule, deployment configuration, replay approval, cost measurement, and alert
+rules remain later integration/deployment work.
 
 Delivery is at-least-once. A task can be delivered again after writes succeed but
 before acknowledgement, so the future processor must use the task key and source
