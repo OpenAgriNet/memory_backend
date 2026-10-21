@@ -214,15 +214,21 @@ or storage code.
 `MEMORY_SCAN_INTERVAL_SECONDS` (30 minutes by default). A session is closed after
 `MEMORY_SESSION_CLOSE_SECONDS` (40 minutes by default).
 
-The adapter deliberately matches the telemetry contract on the current
-`amul-oan-api/main`: root `chat.translation`, schema `chat.turn.v1`, and metadata
-fields `user_id` and `persona`. It also requires the trace-level `userId` to match
-the metadata identity, requires farmer persona in both metadata and input, and uses
-only traces whose `turn_outcome` score is `success`. This mapping is isolated in
-`CurrentMainTelemetryAdapter` so the planned `turn` / `amul.farmer_id` telemetry
-shape changes one boundary instead of the worker.
+The adapter matches two explicit `amul-oan-api` contracts. Chat uses root
+`chat.translation`, schema `chat.turn.v1`, matching trace/metadata identity,
+farmer persona, and the successful `turn_outcome` score. The adapter also accepts
+chat's new `turn` / `turn.v1` contract during the telemetry migration. Voice support depends on
+amul-oan-api PR #432: root `turn`, schema `turn.v1`, `amul.pipeline=telephony`, service
+`amul-oan-api`, `amul.signed_in=true`, a canonical `amul.farmer_id` matching the
+trace identity, full input/output text, and metadata outcome `success`. Missing or
+malformed voice fields fail closed; greetings, moderation rejections, stale or
+disconnected calls, consent-only replies, errors, anonymous calls, and legacy
+`voice-oan-api` traces never become evidence. The mapping stays isolated in
+`CurrentMainTelemetryAdapter`; the task, queue, and processor contracts are unchanged.
 
-Sessions that exceed the task contract are split into chronological tasks. They
+Chat and voice are grouped independently by farmer, session and surface, and the
+dry-run summary reports only per-surface counts and fixed rejection reasons—never
+farmer IDs or conversation text. Sessions that exceed the task contract are split into chronological tasks. They
 keep the same farmer/session subject, and worker progress unions processed-turn
 fingerprints across fragments so no successful fragment is forgotten or replayed.
 
