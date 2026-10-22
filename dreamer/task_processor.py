@@ -7,12 +7,12 @@ import os
 from dataclasses import dataclass
 from typing import Callable, Literal, Protocol, Sequence
 
-import requests
-
 if __package__:
+    from . import memory_client
     from .queue_worker import PermanentTaskError, RetryableTaskError
     from .tasks import MemoryTask, SourceTurn
 else:
+    import memory_client
     from queue_worker import PermanentTaskError, RetryableTaskError
     from tasks import MemoryTask, SourceTurn
 
@@ -83,7 +83,7 @@ def _memory_enabled(task: MemoryTask) -> bool:
         from . import dreamer
     else:
         import dreamer
-    response = requests.get(
+    response = memory_client.get(
         f"{dreamer.MEMORY_API}/memory/{task.farmer_id}/settings", timeout=30
     )
     response.raise_for_status()

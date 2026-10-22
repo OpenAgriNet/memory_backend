@@ -1,5 +1,6 @@
 """Environment configuration shared by the service and maintenance commands."""
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -27,3 +28,42 @@ def qdrant_headers(url=None):
     if (target.scheme, target.netloc) != (configured.scheme, configured.netloc):
         return {}
     return {"api-key": key}
+
+
+_INVALID_MEMORY_TOKENS = {
+    "replace-with-a-long-random-internal-token",
+    "change-me",
+    "changeme",
+}
+
+
+def bearer_token_is_safe(token):
+    """Accept the token68 characters used by an HTTP Bearer credential."""
+    return bool(re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token))
+
+
+def memory_internal_token():
+    """Return a bearer-safe internal token, failing closed on unsafe values."""
+    token = os.environ.get("MEMORY_INTERNAL_TOKEN", "")
+    valid = (
+        len(token) >= 32
+        and bearer_token_is_safe(token)
+        and token.lower() not in _INVALID_MEMORY_TOKENS
+    )
+    if not valid:
+        raise RuntimeError(
+            "Set MEMORY_INTERNAL_TOKEN to at least 32 printable ASCII characters "
+            "with no whitespace or example value"
+        )
+    return token
+
+
+def memory_api_headers(url=None):
+    """Attach the service token only to the configured Memory API origin."""
+    configured = urlsplit(required("MEMORY_API_URL"))
+    target = urlsplit(url or required("MEMORY_API_URL"))
+    configured_origin = (configured.scheme.lower(), configured.netloc.lower())
+    target_origin = (target.scheme.lower(), target.netloc.lower())
+    if configured_origin != target_origin:
+        raise RuntimeError("Refusing to send Memory API credentials to another origin")
+    return {"Authorization": f"Bearer {memory_internal_token()}"}
