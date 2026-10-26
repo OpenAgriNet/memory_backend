@@ -1,4 +1,4 @@
-"""Discover closed chat and voice sessions and enqueue normalized memory tasks.
+"""Discover settled chat and voice traces and enqueue normalized memory tasks.
 
 Only ``CurrentMainTelemetryAdapter`` knows the live telemetry field names.  The
 rest of the producer and worker operate on ``MemoryTask``.
@@ -6,7 +6,6 @@ rest of the producer and worker operate on ``MemoryTask``.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -15,7 +14,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol
+from typing import Any, Mapping, Protocol
 
 from dotenv import load_dotenv
 
@@ -97,20 +96,12 @@ def _farmer_id(value: Any) -> str | None:
     return mobile
 
 
-def _subject_key(farmer_id: str, session_id: str, surface: str) -> str:
-    # Preserve chat's existing keys so widening discovery never republishes it.
-    value = f"{farmer_id}\0{session_id}"
-    if surface != "chat":
-        value += f"\0{surface}"
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
 @dataclass(frozen=True)
 class ProducerConfig:
-    close_seconds: int
+    settle_seconds: int
     scan_seconds: int
     discovery_lookback_seconds: int
-    session_lookback_days: int
+    event_not_before: datetime | None
     dry_run: bool
     allowlist_enabled: bool
     farmer_allowlist: frozenset[str]
@@ -123,15 +114,15 @@ class ProducerConfig:
             ),
             override=False,
         )
-        close_seconds = _int_env(
-            "MEMORY_SESSION_CLOSE_SECONDS", 40 * 60, minimum=60
+        settle_seconds = _int_env(
+            "MEMORY_EVENT_SETTLE_SECONDS", 40 * 60, minimum=60
         )
         scan_seconds = _int_env(
             "MEMORY_SCAN_INTERVAL_SECONDS", 30 * 60, minimum=60
         )
         discovery_lookback_seconds = _int_env(
             "MEMORY_DISCOVERY_LOOKBACK_SECONDS", 24 * 60 * 60,
-            minimum=close_seconds + scan_seconds,
+            minimum=settle_seconds + scan_seconds,
         )
         raw_allowlist = os.environ.get("MEMORY_FARMER_ALLOWLIST", "")
         allowlist: set[str] = set()
@@ -142,14 +133,19 @@ class ProducerConfig:
             if normalized is None:
                 raise RuntimeError("MEMORY_FARMER_ALLOWLIST contains an invalid phone")
             allowlist.add(normalized)
+        not_before_raw = os.environ.get("MEMORY_EVENT_NOT_BEFORE", "").strip()
+        not_before = _timestamp(not_before_raw) if not_before_raw else None
+        if not_before_raw and not_before is None:
+            raise RuntimeError("MEMORY_EVENT_NOT_BEFORE must be an ISO-8601 timestamp")
+        dry_run = _bool_env("MEMORY_PRODUCER_DRY_RUN", True)
+        if not dry_run and not_before is None:
+            raise RuntimeError("MEMORY_EVENT_NOT_BEFORE is required outside dry-run")
         return cls(
-            close_seconds=close_seconds,
+            settle_seconds=settle_seconds,
             scan_seconds=scan_seconds,
             discovery_lookback_seconds=discovery_lookback_seconds,
-            session_lookback_days=_int_env(
-                "MEMORY_SESSION_LOOKBACK_DAYS", 30, minimum=1
-            ),
-            dry_run=_bool_env("MEMORY_PRODUCER_DRY_RUN", True),
+            event_not_before=not_before,
+            dry_run=dry_run,
             allowlist_enabled=_bool_env(
                 "MEMORY_FARMER_ALLOWLIST_ENABLED", True
             ),
@@ -158,17 +154,8 @@ class ProducerConfig:
 
 
 @dataclass(frozen=True)
-class Candidate:
-    session_id: str
-    farmer_id: str
-    surface: str
-    latest_at: datetime
-    latest_trace_id: str
-
-
-@dataclass(frozen=True)
 class ScanResult:
-    sessions_seen: int
+    events_seen: int
     eligible: int
     restricted: int
     would_publish: int
@@ -179,7 +166,7 @@ class ScanResult:
 
     def safe_dict(self) -> dict[str, Any]:
         return {
-            "sessions_seen": self.sessions_seen,
+            "events_seen": self.events_seen,
             "eligible": self.eligible,
             "restricted": self.restricted,
             "would_publish": self.would_publish,
@@ -195,11 +182,11 @@ class ScanResult:
 
 class TaskPublisher(Protocol):
     def publish(self, task: MemoryTask) -> bool: ...
-    def revision_published(self, subject_key: str, revision_key: str) -> bool: ...
-    def mark_revision_published(self, subject_key: str, revision_key: str) -> None: ...
+    def watermark(self) -> datetime | None: ...
+    def advance_watermark(self, value: datetime) -> None: ...
 
 
-class LangfuseSessionSource:
+class LangfuseEventSource:
     def __init__(self, client: LangfuseRO | None = None):
         self.client = client or LangfuseRO()
 
@@ -208,22 +195,6 @@ class LangfuseSessionSource:
             *self.client.traces(start, stop, name=CHAT_TRACE_NAME, fields="core,io,scores"),
             *self.client.traces(start, stop, name=TURN_TRACE_NAME, fields="core,io,scores"),
         ]
-
-    def session(
-        self, session_id: str, stop: datetime, *, lookback_days: int
-    ) -> list[dict[str, Any]]:
-        start = stop - timedelta(days=lookback_days)
-        return [
-            *self.client.traces(
-                start, stop, name=CHAT_TRACE_NAME, sessionId=session_id,
-                fields="core,io,scores",
-            ),
-            *self.client.traces(
-                start, stop, name=TURN_TRACE_NAME, sessionId=session_id,
-                fields="core,io,scores",
-            ),
-        ]
-
 
 class CurrentMainTelemetryAdapter:
     """Map current chat plus PR #432's finalized voice telemetry contracts."""
@@ -326,120 +297,50 @@ class CurrentMainTelemetryAdapter:
             return cls._text(cls._input(row).get("query")), cls._text(row.get("output"))
         return cls._text(row.get("input")), cls._text(row.get("output"))
 
-    def candidate(
-        self, session_id: str, rows: Iterable[Mapping[str, Any]], surface: str = "chat"
-    ) -> tuple[Candidate | None, str | None]:
-        identities: set[str] = set()
-        latest: tuple[datetime, str] | None = None
-        found = False
-        found_success = False
-        for row in rows:
-            if row.get("sessionId") != session_id or self.surface(row) != surface:
-                continue
-            found = True
-            contract = self._contract(row, surface)
-            if contract is None:
-                return None, "schema_mismatch"
-            identity, reason = self._identity(row, surface, contract)
-            if identity is None:
-                return None, reason
-            identities.add(identity)
-            trace_id = row.get("id")
-            observed_at = _timestamp(row.get("timestamp"))
-            if not isinstance(trace_id, str) or not trace_id or observed_at is None:
-                return None, "invalid_trace"
-            if latest is None or observed_at > latest[0]:
-                latest = observed_at, trace_id
-            found_success |= self._successful(row, contract)
-        if not found or latest is None:
-            return None, "empty_session"
-        if len(identities) != 1:
-            return None, "mixed_identity"
-        if not found_success:
-            return None, "no_successful_turn"
-        return Candidate(
-            session_id=session_id,
-            farmer_id=next(iter(identities)),
-            surface=surface,
-            latest_at=latest[0],
-            latest_trace_id=latest[1],
-        ), None
-
-    def tasks(
-        self, candidate: Candidate, rows: Iterable[Mapping[str, Any]]
-    ) -> tuple[MemoryTask, ...]:
-        turns: list[dict[str, str]] = []
-        identities: set[str] = set()
-        seen_trace_ids: set[str] = set()
-        task_source = self.task_sources[candidate.surface]
-        for row in rows:
-            if row.get("sessionId") != candidate.session_id or self.surface(row) != candidate.surface:
-                continue
-            contract = self._contract(row, candidate.surface)
-            if contract is None:
-                raise TaskValidationError("schema_mismatch")
-            identity, reason = self._identity(row, candidate.surface, contract)
-            if identity is None:
-                raise TaskValidationError(reason or "invalid_identity")
-            identities.add(identity)
-            if not self._successful(row, contract):
-                continue
-            query, answer = self._turn_text(row, contract)
-            trace_id = row.get("id")
-            timestamp = row.get("timestamp")
-            # An error/cancelled trace normally has no final assistant output.
-            # It still delayed closure above, but it is not writable evidence.
-            if not all(isinstance(value, str) and value.strip() for value in (
-                trace_id, timestamp, query, answer,
-            )):
-                continue
-            if trace_id in seen_trace_ids:
-                continue
-            seen_trace_ids.add(trace_id)
-            turns.append({
-                "trace_id": trace_id,
-                "timestamp": timestamp,
-                "query": query,
-                "answer": answer,
-            })
-        if identities != {candidate.farmer_id}:
-            raise TaskValidationError("mixed_identity")
-        turns.sort(key=lambda row: _timestamp(row["timestamp"]) or datetime.min.replace(
-            tzinfo=timezone.utc
-        ))
-
-        def build(part: list[dict[str, str]]) -> MemoryTask:
-            return MemoryTask.from_dict({
+    def event(
+        self, row: Mapping[str, Any]
+    ) -> tuple[MemoryTask | None, str | None, str | None]:
+        surface = self.surface(row)
+        if surface is None:
+            return None, "unknown_surface", None
+        contract = self._contract(row, surface)
+        if contract is None:
+            return None, "schema_mismatch", surface
+        session_id = row.get("sessionId")
+        trace_id = row.get("id")
+        timestamp = row.get("timestamp")
+        if not isinstance(session_id, str) or not session_id:
+            return None, "missing_session", surface
+        if not isinstance(trace_id, str) or not trace_id or _timestamp(timestamp) is None:
+            return None, "invalid_trace", surface
+        identity, reason = self._identity(row, surface, contract)
+        if identity is None:
+            return None, reason or "invalid_identity", surface
+        if not self._successful(row, contract):
+            return None, "not_successful", surface
+        query, answer = self._turn_text(row, contract)
+        if not query or not answer:
+            return None, "missing_text", surface
+        try:
+            task = MemoryTask.from_dict({
                 "schema_version": TASK_SCHEMA_VERSION,
-                "farmer_id": candidate.farmer_id,
-                "session_id": candidate.session_id,
-                "source": task_source,
-                "turns": part,
+                "farmer_id": identity,
+                "session_id": session_id,
+                "source": self.task_sources[surface],
+                "turns": [{
+                    "trace_id": trace_id,
+                    "timestamp": timestamp,
+                    "query": query,
+                    "answer": answer,
+                }],
             })
-
-        parts: list[MemoryTask] = []
-        current: list[dict[str, str]] = []
-        splittable = {"invalid_turn_count", "task_content_too_large", "task_too_large"}
-        for turn in turns:
-            try:
-                build([*current, turn])
-            except TaskValidationError as exc:
-                if not current or exc.code not in splittable:
-                    raise
-                parts.append(build(current))
-                current = [turn]
-                build(current)  # A single oversize turn remains invalid.
-            else:
-                current.append(turn)
-        if current:
-            parts.append(build(current))
-        if not parts:
-            raise TaskValidationError("invalid_turn_count")
-        return tuple(parts)
+        except TaskValidationError as exc:
+            return None, exc.code, surface
+        return task, None, surface
 
 
 def produce_once(
-    source: LangfuseSessionSource,
+    source: LangfuseEventSource,
     publisher: TaskPublisher | None,
     config: ProducerConfig,
     *,
@@ -448,86 +349,83 @@ def produce_once(
 ) -> ScanResult:
     now = (now or _utc_now()).astimezone(timezone.utc)
     adapter = adapter or CurrentMainTelemetryAdapter()
-    recent = source.recent(
-        now - timedelta(seconds=config.discovery_lookback_seconds), now
+    settled_before = now - timedelta(seconds=config.settle_seconds)
+    not_before = config.event_not_before or (
+        settled_before - timedelta(seconds=config.discovery_lookback_seconds)
     )
-    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    stored_watermark = publisher.watermark() if publisher is not None else None
+    cursor = max(not_before, stored_watermark or not_before)
+    scan_start = max(
+        not_before,
+        cursor - timedelta(seconds=config.discovery_lookback_seconds),
+    )
+    recent = (
+        source.recent(scan_start, settled_before)
+        if settled_before >= cursor else []
+    )
     skipped: Counter[str] = Counter()
     by_surface: dict[str, Counter[str]] = {
         surface: Counter() for surface in adapter.task_sources
     }
-    for row in recent:
+    eligible = restricted = would_publish = published = duplicates = 0
+    seen_task_keys: set[str] = set()
+    for row in sorted(
+        recent,
+        key=lambda value: (
+            _timestamp(value.get("timestamp"))
+            if isinstance(value, Mapping) else None
+        ) or datetime.min.replace(tzinfo=timezone.utc),
+    ):
         if not isinstance(row, Mapping):
             skipped["invalid_trace"] += 1
             continue
-        session_id = row.get("sessionId")
-        if not isinstance(session_id, str) or not session_id:
-            skipped["missing_session"] += 1
+        observed_at = _timestamp(row.get("timestamp"))
+        if observed_at is None:
+            skipped["invalid_trace"] += 1
             continue
-        surface = adapter.surface(row)
-        if surface is None:
-            skipped["unknown_surface"] += 1
+        if observed_at < not_before or observed_at > settled_before:
+            skipped["outside_event_window"] += 1
             continue
-        grouped.setdefault((session_id, surface), []).append(row)
-
-    eligible = restricted = would_publish = published = duplicates = 0
-    close_before = now - timedelta(seconds=config.close_seconds)
-    for (session_id, surface), rows in grouped.items():
-        candidate, reason = adapter.candidate(session_id, rows, surface)
-        if candidate is None:
-            skipped[reason or "invalid_session"] += 1
-            by_surface[surface][reason or "invalid_session"] += 1
+        task, reason, surface = adapter.event(row)
+        if task is None:
+            skipped[reason or "invalid_event"] += 1
+            if surface is not None:
+                by_surface[surface][reason or "invalid_event"] += 1
             continue
-        if candidate.latest_at > close_before:
-            skipped["session_open"] += 1
-            by_surface[surface]["session_open"] += 1
+        if task.task_key in seen_task_keys:
+            duplicates += 1
+            by_surface[surface]["duplicates"] += 1
             continue
+        seen_task_keys.add(task.task_key)
         eligible += 1
         by_surface[surface]["eligible"] += 1
         if (
             config.allowlist_enabled
-            and candidate.farmer_id not in config.farmer_allowlist
+            and task.farmer_id not in config.farmer_allowlist
         ):
             restricted += 1
             by_surface[surface]["restricted"] += 1
             continue
-
-        revision_key = RedisStreamTaskQueue.revision_key(candidate.latest_trace_id)
-        subject_key = _subject_key(candidate.farmer_id, candidate.session_id, candidate.surface)
-        if publisher is not None and publisher.revision_published(subject_key, revision_key):
-            duplicates += 1
-            by_surface[surface]["duplicates"] += 1
-            continue
-        try:
-            session_rows = source.session(
-                candidate.session_id,
-                now,
-                lookback_days=config.session_lookback_days,
-            )
-            tasks = adapter.tasks(candidate, session_rows)
-        except TaskValidationError as exc:
-            skipped[exc.code] += 1
-            by_surface[surface][exc.code] += 1
-            continue
-        would_publish += len(tasks)
-        by_surface[surface]["would_publish"] += len(tasks)
+        would_publish += 1
+        by_surface[surface]["would_publish"] += 1
         if config.dry_run:
             continue
         if publisher is None:
             raise RuntimeError("publisher is required when dry-run is disabled")
-        for task in tasks:
-            if publisher.publish(task):
-                published += 1
-                by_surface[surface]["published"] += 1
-            else:
-                duplicates += 1
-                by_surface[surface]["duplicates"] += 1
-        # Only mark the source revision after every fragment is durably present
-        # or was already published. A partial failure is retried safely.
-        publisher.mark_revision_published(subject_key, revision_key)
+        if publisher.publish(task):
+            published += 1
+            by_surface[surface]["published"] += 1
+        else:
+            duplicates += 1
+            by_surface[surface]["duplicates"] += 1
+
+    if not config.dry_run and settled_before >= cursor:
+        if publisher is None:
+            raise RuntimeError("publisher is required when dry-run is disabled")
+        publisher.advance_watermark(settled_before)
 
     return ScanResult(
-        sessions_seen=len(grouped),
+        events_seen=len(recent),
         eligible=eligible,
         restricted=restricted,
         would_publish=would_publish,
@@ -539,14 +437,14 @@ def produce_once(
 
 
 def _run_once(config: ProducerConfig) -> ScanResult:
-    source = LangfuseSessionSource()
+    source = LangfuseEventSource()
     publisher = None if config.dry_run else RedisStreamTaskQueue()
     return produce_once(source, publisher, config)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Find closed chat and voice sessions and enqueue normalized memory tasks."
+        description="Find settled chat and voice traces and enqueue normalized memory tasks."
     )
     parser.add_argument(
         "--forever",

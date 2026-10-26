@@ -83,7 +83,7 @@ model. Keep the service's writes and internal routes restricted to trusted calle
 the service itself does not implement end-user authentication.
 
 Queue tasks are normalized before they reach the worker. `process_task` handles one
-session at a time and records only hashed progress in `QDRANT_TASK_STATE_COLLECTION`.
+source event at a time and records only hashed progress in `QDRANT_TASK_STATE_COLLECTION`.
 Claims persist a lease owner and expiry. Active leases defer redelivery; an expired
 claim can be taken over only when no write tool had started. A crash after write work
 started becomes `needs_review`, and replay requires the explicit
@@ -91,12 +91,12 @@ started becomes `needs_review`, and replay requires the explicit
 There is deliberately no renewal thread or retry schedule here; the queue owns retry
 timing.
 
-Source turns are immutable. Reusing a trace ID with changed content sends the task to
-review; it is never checkpointed as a successful correction. Previously processed
-turns are not replayed as writable evidence: late arrivals are passed to the model by
-themselves in chronological pending-only chunks. `python -m dreamer.worker <task.json>`
-is the supported one-task composition for local/integration use. The closed-session
-producer and Redis Streams worker are described below.
+Source events are immutable. Reusing a trace ID with changed content sends the task to
+review; it is never checkpointed as a successful correction. Each task contains only
+that event, so later activity in the same session cannot replay earlier evidence.
+`python -m dreamer.worker <task.json>` is the supported one-task composition for
+local/integration use. The settled-event producer and Redis Streams worker are
+described below.
 
 The background agent proposes changes through `writer.apply`. Failed or malformed
 checks retry once, then block saving and report the proposal for retry. The standing
@@ -182,10 +182,12 @@ never copied into memory or these docs. Langfuse access is read-only.
 
 New background orchestration must adapt source telemetry into the normalized
 `dreamer.tasks.MemoryTask` contract before enqueueing it. The queue worker never
-reads Langfuse field names directly. A task contains one farmer/session,
-chronological turns, a source label, and a schema version. It derives opaque task
-and subject keys for idempotency and safe logging without exposing farmer IDs or
-conversation text.
+reads Langfuse field names directly. A task contains one completed source event,
+its farmer and session provenance, a source label, and a schema version. It derives
+an exact-payload task key and a stable farmer/source/trace subject key for
+idempotency and safe logging without exposing farmer IDs or conversation text.
+The session identifier is provenance only: reopening a session never makes its
+earlier events part of a new task.
 
 The contract accepts only a canonical 10-digit farmer mobile. It does not trim or
 repair identities and rejects anonymous, path-like, oversized, or otherwise invalid
@@ -193,8 +195,8 @@ values. The producer owns the trust decision before creating that task. The curr
 adapter uses the fields available on main and applies the extra identity/persona
 matching described below; its remaining authentication limitation is explicit.
 
-Tasks are bounded before model work: at most 256 KiB of canonical UTF-8 JSON, 100
-turns, 8,000 query characters, 16,000 answer characters, and 128,000 aggregate
+Tasks are bounded before model work: exactly one event, at most 256 KiB of canonical
+UTF-8 JSON, 8,000 query characters, 16,000 answer characters, and 128,000 aggregate
 query/answer characters. Session and trace identifiers are bounded to 200 safe
 identifier characters; source labels are allowlisted and bounded to 64. Timestamps
 are normalized to UTC before keys are calculated. Log summaries hash the source
@@ -208,11 +210,12 @@ separate dead-letter stream. Retryable failures use a Redis sorted-set delay bef
 returning to the stream. Changing trace names or metadata does not change extraction
 or storage code.
 
-### Closed-session producer
+### Settled-event producer
 
 `python -m dreamer.producer` performs one scan. Add `--forever` to repeat every
-`MEMORY_SCAN_INTERVAL_SECONDS` (30 minutes by default). A session is closed after
-`MEMORY_SESSION_CLOSE_SECONDS` (40 minutes by default).
+`MEMORY_SCAN_INTERVAL_SECONDS` (30 minutes by default). Each trace becomes eligible
+after `MEMORY_EVENT_SETTLE_SECONDS` (40 minutes by default), regardless of later
+activity in the same session.
 
 The adapter matches two explicit `amul-oan-api` contracts. Chat uses root
 `chat.translation`, schema `chat.turn.v1`, matching trace/metadata identity,
@@ -226,15 +229,17 @@ disconnected calls, consent-only replies, errors, anonymous calls, and legacy
 `voice-oan-api` traces never become evidence. The mapping stays isolated in
 `CurrentMainTelemetryAdapter`; the task, queue, and processor contracts are unchanged.
 
-Chat and voice are grouped independently by farmer, session and surface, and the
-dry-run summary reports only per-surface counts and fixed rejection reasons—never
-farmer IDs or conversation text. Sessions that exceed the task contract are split into chronological tasks. They
-keep the same farmer/session subject, and worker progress unions processed-turn
-fingerprints across fragments so no successful fragment is forgotten or replayed.
+Chat and voice traces are validated independently, and the dry-run summary reports
+only per-surface event counts and fixed rejection reasons—never farmer IDs or
+conversation text. The producer never retrieves the rest of a trace's session.
+Its Redis watermark advances only after the settled scan interval is handled, while
+overlap scans and trace-scoped task keys make restart delivery idempotent.
 
 Safe rollout is the default:
 
 - `MEMORY_PRODUCER_DRY_RUN=true` prevents queue writes.
+- `MEMORY_EVENT_NOT_BEFORE` sets the UTC rollout boundary and is required before
+  dry-run is disabled. Older traces are never backfilled.
 - `MEMORY_FARMER_ALLOWLIST_ENABLED=true` restricts eligibility to the comma-separated
   canonical phones in `MEMORY_FARMER_ALLOWLIST`; an empty list selects nobody.
 - After the allowlisted test is accepted, set
@@ -269,6 +274,7 @@ python3 -m unittest discover -s tests -p 'test_unit.py'
 python3 -m unittest discover -s tests -p 'test_review_regressions.py'
 python3 -m unittest discover -s tests -p 'test_bot_tools.py'
 python3 -m unittest discover -s tests -p 'test_queue_worker.py'
+python3 -m unittest discover -s tests -p 'test_producer.py'
 ```
 
 `tests/test_service.py` writes synthetic records only when `AMUL_MEMORY_INTEGRATION=1`.

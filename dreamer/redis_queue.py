@@ -5,7 +5,6 @@ stream.  Task validation and processing remain broker-neutral.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -71,8 +70,8 @@ class RedisStreamTaskQueue:
         self.dedupe_prefix = _key(
             "MEMORY_QUEUE_DEDUPE_PREFIX", "amul:memory:task-published:v1"
         )
-        self.revision_prefix = _key(
-            "MEMORY_QUEUE_REVISION_PREFIX", "amul:memory:session-revision:v1"
+        self.watermark_key = _key(
+            "MEMORY_QUEUE_WATERMARK_KEY", "amul:memory:event-watermark:v1"
         )
         self.retry_set = _key(
             "MEMORY_QUEUE_RETRY_SET", "amul:memory:tasks:retry:v1"
@@ -128,13 +127,14 @@ class RedisStreamTaskQueue:
                 raise
         self._ready = True
 
-    @staticmethod
-    def revision_key(trace_id: str) -> str:
-        return hashlib.sha256(trace_id.encode("utf-8")).hexdigest()
-
-    def revision_published(self, subject_key: str, revision_key: str) -> bool:
-        value = self.client.get(f"{self.revision_prefix}:{subject_key}")
-        return value == revision_key
+    def watermark(self) -> datetime | None:
+        value = self.client.get(self.watermark_key)
+        if value is None:
+            return None
+        try:
+            return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
+        except (TypeError, ValueError, OSError) as exc:
+            raise RuntimeError("invalid producer watermark") from exc
 
     def publish(self, task: MemoryTask) -> bool:
         """Publish one task once per task key.
@@ -161,12 +161,17 @@ class RedisStreamTaskQueue:
             self.max_length, body, task.task_key, self.dedupe_seconds,
         ))
 
-    def mark_revision_published(self, subject_key: str, revision_key: str) -> None:
-        self.client.set(
-            f"{self.revision_prefix}:{subject_key}",
-            revision_key,
-            ex=self.dedupe_seconds,
-        )
+    def advance_watermark(self, value: datetime) -> None:
+        milliseconds = int(value.astimezone(timezone.utc).timestamp() * 1000)
+        script = """
+        local current = redis.call('GET', KEYS[1])
+        if current and tonumber(current) >= tonumber(ARGV[1]) then
+          return 0
+        end
+        redis.call('SET', KEYS[1], ARGV[1])
+        return 1
+        """
+        self.client.eval(script, 1, self.watermark_key, milliseconds)
 
     def _promote_due_retries(self) -> None:
         script = """
