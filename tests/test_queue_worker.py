@@ -60,18 +60,28 @@ class TestMemoryTask(unittest.TestCase):
         for private in (first.farmer_id, first.session_id, first.turns[0].query, first.turns[0].answer):
             self.assertNotIn(private, summary)
 
-    def test_late_turn_changes_task_key_but_not_subject_key(self):
+    def test_changed_event_changes_task_key_but_not_subject_key(self):
         first = MemoryTask.from_dict(task_body())
         changed = task_body()
-        changed["turns"].append({
-            "trace_id": "trace-2",
-            "timestamp": "2026-10-17T08:10:00Z",
-            "query": "Her temperature is normal",
-            "answer": "Check whether she is chewing cud.",
-        })
+        changed["turns"][0]["answer"] = "Check whether she is chewing cud."
         second = MemoryTask.from_dict(changed)
         self.assertNotEqual(first.task_key, second.task_key)
         self.assertEqual(first.subject_key, second.subject_key)
+
+    def test_session_is_provenance_not_event_identity(self):
+        first = MemoryTask.from_dict(task_body())
+        changed = task_body()
+        changed["session_id"] = "session-reopened-after-28-days"
+        second = MemoryTask.from_dict(changed)
+        self.assertNotEqual(first.task_key, second.task_key)
+        self.assertEqual(first.subject_key, second.subject_key)
+
+    def test_different_trace_has_a_different_subject(self):
+        first = MemoryTask.from_dict(task_body())
+        changed = task_body()
+        changed["turns"][0]["trace_id"] = "trace-2"
+        second = MemoryTask.from_dict(changed)
+        self.assertNotEqual(first.subject_key, second.subject_key)
 
     def test_timestamps_are_canonical_before_hashing(self):
         variants = []
@@ -105,41 +115,20 @@ class TestMemoryTask(unittest.TestCase):
 
     def test_turn_count_and_payload_limits(self):
         body = task_body()
-        template = body["turns"][0]
-        body["turns"] = [dict(template, trace_id=f"t-{index}",
-                              timestamp=f"2026-10-17T08:{index // 60:02d}:{index % 60:02d}Z",
-                              query="q", answer="a") for index in range(MAX_TURNS)]
         MemoryTask.from_dict(body)
-        body["turns"].append(dict(body["turns"][-1], trace_id="too-many"))
-        with self.assertRaisesRegex(TaskValidationError, "invalid_turn_count"):
-            MemoryTask.from_dict(body)
-
-        oversized = task_body()
-        template = oversized["turns"][0]
-        oversized["turns"] = [dict(template, trace_id=f"large-{index}",
-                                          timestamp=f"2026-10-17T08:0{index}:00Z",
-                                          query="q", answer="🐄" * MAX_ANSWER_CHARS)
-                              for index in range(8)]
-        with self.assertRaisesRegex(TaskValidationError, "task_too_large"):
-            MemoryTask.from_dict(oversized)
+        for turns in ([], [*body["turns"], copy.deepcopy(body["turns"][0])]):
+            changed = task_body()
+            changed["turns"] = turns
+            with self.assertRaisesRegex(TaskValidationError, "invalid_turn_count"):
+                MemoryTask.from_dict(changed)
 
     def test_rejects_malformed_tasks(self):
         def extra(body):
             body["telemetry_metadata"] = {}
 
-        def duplicate(body):
-            body["turns"].append(copy.deepcopy(body["turns"][0]))
-
-        def unordered(body):
-            later = copy.deepcopy(body["turns"][0])
-            later.update(trace_id="later", timestamp="2026-10-17T09:00:00Z")
-            body["turns"].insert(0, later)
-
         mutations = (
             ("unsupported_schema_version", lambda body: body.__setitem__("schema_version", 2)),
             ("invalid_task_fields", extra),
-            ("duplicate_trace_id", duplicate),
-            ("turns_not_chronological", unordered),
             ("invalid_turn_timestamp", lambda body: body["turns"][0].__setitem__("timestamp", "bad")),
             ("turn_timestamp_needs_timezone",
              lambda body: body["turns"][0].__setitem__("timestamp", "2026-10-17T08:00:00")),

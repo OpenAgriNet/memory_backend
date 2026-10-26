@@ -162,10 +162,12 @@ never copied into memory or these docs. Langfuse access is read-only.
 
 New background orchestration must adapt source telemetry into the normalized
 `dreamer.tasks.MemoryTask` contract before enqueueing it. The queue worker never
-reads Langfuse field names directly. A task contains one farmer/session,
-chronological turns, a source label, and a schema version. It derives opaque task
-and subject keys for idempotency and safe logging without exposing farmer IDs or
-conversation text.
+reads Langfuse field names directly. A task contains one completed source event,
+its farmer and session provenance, a source label, and a schema version. It derives
+an exact-payload task key and a stable farmer/source/trace subject key for
+idempotency and safe logging without exposing farmer IDs or conversation text.
+The session identifier is provenance only: reopening a session never makes its
+earlier events part of a new task.
 
 The contract accepts only an authenticated canonical 10-digit farmer mobile. It
 does not trim or repair identities and rejects anonymous, path-like, oversized, or
@@ -174,8 +176,8 @@ from authenticated claims, require JWT `user_type=farmer`, and exclude doctor an
 anonymous turns. It must never copy request-controlled `user_id`, `sub`, or a
 fallback identity into `farmer_id`.
 
-Tasks are bounded before model work: at most 256 KiB of canonical UTF-8 JSON, 100
-turns, 8,000 query characters, 16,000 answer characters, and 128,000 aggregate
+Tasks are bounded before model work: exactly one event, at most 256 KiB of
+canonical UTF-8 JSON, 8,000 query characters, 16,000 answer characters, and 128,000 aggregate
 query/answer characters. Session and trace identifiers are bounded to 200 safe
 identifier characters; source labels are allowlisted and bounded to 64. Timestamps
 are normalized to UTC before keys are calculated. Log summaries hash the source
