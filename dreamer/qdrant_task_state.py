@@ -1,4 +1,4 @@
-"""Lease-protected, hash-only task progress outside the farmer-memory collection."""
+"""Lease-protected, hash-only event progress outside the farmer-memory collection."""
 from __future__ import annotations
 
 import os

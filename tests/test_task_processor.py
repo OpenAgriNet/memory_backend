@@ -24,14 +24,15 @@ from tasks import MemoryTask  # noqa: E402
 from worker import run_one  # noqa: E402
 
 
-def task(turns=1):
+def task(trace_index=0):
     return MemoryTask.from_dict({
         "schema_version": 1, "farmer_id": "9876543210",
         "session_id": "session-1", "source": "chat-main",
         "turns": [{
-            "trace_id": f"trace-{index}", "timestamp": f"2026-10-17T08:0{index}:00Z",
-            "query": f"question {index}", "answer": f"answer {index}",
-        } for index in range(turns)],
+            "trace_id": f"trace-{trace_index}",
+            "timestamp": f"2026-10-17T08:0{trace_index}:00Z",
+            "query": f"question {trace_index}", "answer": f"answer {trace_index}",
+        }],
     })
 
 
@@ -94,16 +95,26 @@ class TestProcessor(unittest.TestCase):
                                               settings_check=check).outcome, "no_op")
                 self.assertNotIn("writing", state.actions)
 
-    def test_late_turn_in_same_chunk_sends_only_pending_evidence(self):
-        full = task(3)
-        previous = tuple(processed_turn(turn) for turn in full.turns[:2])
-        state = FakeState(BeginResult("started", previous))
+    def test_runner_receives_only_the_source_event(self):
+        event = task()
+        state = FakeState(BeginResult("started"))
         seen = []
         def runner(_task, chunks, _before):
             seen.extend(chunks)
             return 0
-        process_task(full, state, runner=runner, settings_check=lambda _: True)
-        self.assertEqual([[row["trace_id"] for row in chunk] for chunk in seen], [["trace-2"]])
+        process_task(event, state, runner=runner, settings_check=lambda _: True)
+        self.assertEqual([[row["trace_id"] for row in chunk] for chunk in seen], [["trace-0"]])
+
+    def test_two_events_in_one_session_have_independent_state(self):
+        first, second = task(0), task(1)
+        self.assertEqual(first.session_id, second.session_id)
+        self.assertNotEqual(first.subject_key, second.subject_key)
+        for value in (first, second):
+            state = FakeState()
+            result = process_task(
+                value, state, runner=lambda *_: 0, settings_check=lambda _: True
+            )
+            self.assertEqual(result.outcome, "no_op")
 
     def test_changed_content_under_same_trace_requires_review(self):
         original = task()

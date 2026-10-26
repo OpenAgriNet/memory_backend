@@ -1,9 +1,8 @@
-"""Process one normalized session task without depending on its telemetry source."""
+"""Process one normalized source event without depending on its telemetry source."""
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 from dataclasses import dataclass
 from typing import Callable, Literal, Protocol, Sequence
 
@@ -136,13 +135,6 @@ def _default_runner(
     return writes
 
 
-def _session_chunks(turns: list[dict[str, str]]) -> list[list[dict[str, str]]]:
-    cap = int(os.environ.get("DREAMER_CHUNK_TURNS", "10"))
-    if cap <= 0:
-        raise RuntimeError("DREAMER_CHUNK_TURNS must be positive")
-    return [turns[index:index + cap] for index in range(0, len(turns), cap)]
-
-
 def _record_failure(
     state_store: TaskStateStore, task: MemoryTask, disposition: FailureDisposition
 ) -> None:
@@ -159,7 +151,7 @@ def process_task(
     runner: Runner | None = None,
     settings_check: Callable[[MemoryTask], bool] | None = None,
 ) -> ProcessResult:
-    """Process only new immutable turns and never repeat an uncertain mutation."""
+    """Process one immutable event and never repeat an uncertain mutation."""
     try:
         begin = state_store.begin(task)
     except Exception as exc:
@@ -209,7 +201,7 @@ def process_task(
             raise RetryableTaskError("task_completion_uncertain") from exc
         return ProcessResult("no_op")
 
-    chunks = _session_chunks(pending_turns)
+    chunks = [pending_turns] if pending_turns else []
     if not chunks:
         try:
             state_store.complete(task, "no_op", all_processed)

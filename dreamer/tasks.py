@@ -1,4 +1,4 @@
-"""Telemetry-independent input contract for the memory worker.
+"""Telemetry-independent event contract for the memory worker.
 
 Source adapters may change as telemetry changes.  The worker accepts only this
 normalized task shape, so source field names cannot leak into extraction, retry,
@@ -16,7 +16,7 @@ from typing import Any, Mapping
 
 TASK_SCHEMA_VERSION = 1
 MAX_TASK_BYTES = 256 * 1024
-MAX_TURNS = 100
+MAX_TURNS = 1
 MAX_SESSION_ID_CHARS = 200
 MAX_TRACE_ID_CHARS = 200
 MAX_SOURCE_CHARS = 64
@@ -122,7 +122,7 @@ class MemoryTask:
             raise TaskValidationError("unsupported_schema_version")
 
         raw_turns = payload.get("turns")
-        if not isinstance(raw_turns, list) or not raw_turns or len(raw_turns) > MAX_TURNS:
+        if not isinstance(raw_turns, list) or len(raw_turns) != MAX_TURNS:
             raise TaskValidationError("invalid_turn_count")
         turns = tuple(SourceTurn.from_dict(turn) for turn in raw_turns)
         if sum(len(turn.query) + len(turn.answer) for turn in turns) > MAX_CONTENT_CHARS:
@@ -168,8 +168,14 @@ class MemoryTask:
 
     @property
     def subject_key(self) -> str:
-        """Opaque stable key for one farmer/session, without exposing either."""
-        subject = f"{self.farmer_id}\0{self.session_id}".encode("utf-8")
+        """Opaque stable key for one immutable source event.
+
+        ``session_id`` is deliberately excluded. Sessions can be reopened weeks
+        later; the trace is the ingestion and processing boundary.
+        """
+        subject = (
+            f"{self.farmer_id}\0{self.source}\0{self.turns[0].trace_id}"
+        ).encode("utf-8")
         return hashlib.sha256(subject).hexdigest()
 
     def redacted_summary(self) -> dict[str, Any]:
