@@ -53,14 +53,18 @@ import sys
 
 import requests
 
-import agent
-import dates
-import lf
-import llm
-import prompts
-import tools
-import writer
-from runtime_config import required
+if __package__:
+    from . import agent, dates, lf, llm, prompts, tools, writer
+    from service.runtime_config import required
+else:
+    import agent
+    import dates
+    import lf
+    import llm
+    import prompts
+    import tools
+    import writer
+    from runtime_config import required
 
 MEMORY_API = required("MEMORY_API_URL").rstrip("/")
 MATCH_CANDIDATES = int(os.environ.get("DREAMER_MATCH_CANDIDATES", "5"))
@@ -127,12 +131,14 @@ def batches(queues):
 # Memory service
 # --------------------------------------------------------------------------
 
-def _known_keys():
+def _known_keys(strict=False):
     try:
         r = requests.get(f"{MEMORY_API}/keys", timeout=30)
         r.raise_for_status()
         return [{"key": k["key"], "description": k.get("description")} for k in r.json()["keys"]]
     except Exception as exc:  # noqa: BLE001 - first run has no keys yet
+        if strict:
+            raise RuntimeError("could not read key vocabulary") from exc
         print(f"  ! could not read key vocabulary ({exc}); proceeding without it", file=sys.stderr)
         return []
 

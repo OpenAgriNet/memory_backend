@@ -1,5 +1,6 @@
 """Regression checks using synthetic memories; no services or model calls."""
 import asyncio
+import hashlib
 import os
 import sys
 import unittest
@@ -285,6 +286,68 @@ class TestWriteOptOut(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(error.exception.status_code, 503)
             qdrant.assert_not_called()
 
+
+class TestEpisodeSummaries(unittest.IsolatedAsyncioTestCase):
+    def request(self, **changes):
+        values = {
+            "surface": "chat", "session_id": "session-1",
+            "episode_number": 1, "episode_revision": 1,
+            "episode_started_at": "2026-10-17T08:00:00Z",
+            "episode_ended_at": "2026-10-17T08:20:00Z",
+            "part_number": 1, "part_count": 2,
+            "headline": "Feeding discussion", "expanded": "The first part was discussed.",
+            "source_traces": ["trace-1"], "pending_trace_ids": ["trace-1"],
+        }
+        values.update(changes)
+        return api.EpisodeSummaryRequest(**values)
+
+    def subject(self):
+        return hashlib.sha256(
+            f"9876543210\0chat\0session-1\0{1}".encode("utf-8")
+        ).hexdigest()
+
+    async def test_part_advances_one_summary_and_unions_provenance(self):
+        old = entry(
+            record_kind="episode", episode_subject_key=self.subject(),
+            episode_revision=1, episode_part_number=1, episode_part_count=2,
+            first_source_ts="2026-10-17T08:00:00Z", source_traces=["trace-1"],
+        )
+        request = self.request(
+            part_number=2, headline="Complete feeding discussion",
+            expanded="Both parts were discussed.", source_traces=["trace-2"],
+            pending_trace_ids=["trace-2"],
+        )
+        with patch.object(api, "_require_memory_enabled", new_callable=AsyncMock), patch.object(
+                api, "_current_episode_summary", new_callable=AsyncMock,
+                return_value={"id": "old", "payload": old}), patch.object(
+                api, "_store_entry", new_callable=AsyncMock,
+                return_value={"id": "new"}) as store, patch.object(
+                api, "_retire", new_callable=AsyncMock) as retire:
+            result = await api.put_episode_summary("9876543210", self.subject(), request)
+        self.assertTrue(result["applied"])
+        stored_entry = store.await_args.args[1]
+        self.assertEqual(stored_entry.source_traces, ["trace-1", "trace-2"])
+        self.assertEqual(store.await_args.kwargs["record_kind"], "episode")
+        self.assertEqual(store.await_args.kwargs["system_fields"]["episode_part_number"], 2)
+        retire.assert_awaited_once()
+
+    async def test_retry_is_unchanged_and_identity_mismatch_is_rejected(self):
+        request = self.request()
+        old = entry(
+            record_kind="episode", episode_subject_key=self.subject(),
+            episode_revision=1, episode_part_number=1, episode_part_count=2,
+            source_traces=["trace-1"],
+        )
+        with patch.object(api, "_require_memory_enabled", new_callable=AsyncMock), patch.object(
+                api, "_current_episode_summary", new_callable=AsyncMock,
+                return_value={"id": "old", "payload": old}), patch.object(
+                api, "_store_entry", new_callable=AsyncMock) as store:
+            result = await api.put_episode_summary("9876543210", self.subject(), request)
+            self.assertTrue(result["unchanged"])
+            store.assert_not_awaited()
+            with self.assertRaises(api.HTTPException) as error:
+                await api.put_episode_summary("9876543210", "0" * 64, request)
+        self.assertEqual(error.exception.status_code, 409)
 
 class TestPublicBoundaries(unittest.IsolatedAsyncioTestCase):
     async def test_public_metadata_cannot_expose_private_alias(self):

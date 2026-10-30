@@ -27,6 +27,8 @@ and model endpoints. `.env` is ignored by git; process environment takes precede
 - `QDRANT_API_KEY`: sent as `api-key` on Qdrant requests; leave empty only for an
   unauthenticated local instance. It is not sent to the embedding/model services.
 - `QDRANT_COLLECTION`: collection used by the memory service and repair commands.
+- `QDRANT_TASK_STATE_COLLECTION`: separate hash-only worker progress collection.
+  It requires Qdrant 1.17+ and must not be set to `QDRANT_COLLECTION`.
 - `MARQO_URL`, `MARQO_INDEX`, `EMBED_DIM`: embedding service and vector configuration.
 - `DREAMER_BASE_URL`, `DREAMER_MODEL`: configured OpenAI-compatible model endpoint.
 - `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`: the source
@@ -74,9 +76,31 @@ mandatory taxonomy. Unknown fields are omitted/reported; bounds are enforced.
 Only the administrative settings endpoint writes the separate Qdrant reply-use flag.
 The global bot switch defaults off. Per-farmer settings currently default on; explicit
 off and failed flag reads suppress reply memory. Background learning can continue via
-internal reads without changing that flag. Keep the service's writes and internal
-routes restricted to trusted callers; the service itself does not implement end-user
-authentication.
+internal reads without changing that flag, but every farmer-memory write, update,
+fold, re-index, and profile update fails closed while memory is disabled or its
+setting cannot be checked. The worker checks the same setting before invoking the
+model. Keep the service's writes and internal routes restricted to trusted callers;
+the service itself does not implement end-user authentication.
+
+Queue tasks are normalized before they reach the worker. `process_task` handles one
+ordered episode part/revision at a time and records only hashed progress in
+`QDRANT_TASK_STATE_COLLECTION`.
+Claims persist a lease owner and expiry. Active leases defer redelivery; an expired
+claim can be taken over only when no write tool had started. A crash after write work
+started becomes `needs_review`, and replay requires the explicit
+`administrative_recover(..., replay_confirmed_safe=True)` path after inspection.
+There is deliberately no renewal thread or retry schedule here; the queue owns retry
+timing.
+
+Source turns are immutable. Reusing a trace ID with changed content sends the task to
+review; it is never checkpointed as a successful correction. Dreamer receives every
+turn in the bounded episode part for context, while deterministic tool checks allow
+ordinary memory mutations only when their evidence includes a newly pending trace.
+Every processed part/revision rewrites one system-owned episode summary; prior
+summaries are supplied when a later part or revision must preserve earlier context.
+`python -m dreamer.worker <task.json>`
+is the supported one-task composition for local/integration use; a later producer PR
+supplies the real broker adapter and telemetry event discovery.
 
 The background agent proposes changes through `writer.apply`. Failed or malformed
 checks retry once, then block saving and report the proposal for retry. The standing
@@ -190,21 +214,21 @@ conversation text.
 
 `dreamer.queue_worker.consume_one` defines the broker boundary: receive,
 acknowledge, retry, and dead-letter. It acknowledges only after processing
-succeeds. The concrete queue provider and session-closing telemetry adapter are
+succeeds. The concrete queue provider and settled-event telemetry adapter are
 separate work; changing trace names or metadata must not change extraction or
 storage code.
 
 Telemetry discovery remains a later producer PR. That PR must inspect the then-live
 `amul-oan-api/main` contract rather than assume field names. It owns current
 root-turn mapping, farmer-only eligibility, authenticated identity extraction,
-session-close policy, periodic scans, the concrete queue/visibility timeout/retry
+event-settlement policy, periodic scans, the concrete queue/visibility timeout/retry
 and DLQ policy, allowlisted dry-run/replay rollout, and zero-eligible/failure alerts.
 Per-phone erasure, restricted read-only bot Qdrant credentials, worker image,
 schedule, and deployment configuration are also later integration/deployment work;
 they are not implemented by this queue boundary.
 
 Delivery is at-least-once. A task can be delivered again after writes succeed but
-before acknowledgement, so the future processor must use the episode subject key,
+before acknowledgement, so the processor uses the episode subject key,
 exact task revision and pending source trace IDs for idempotency. Retry and
 dead-letter reasons contain only fixed error
 codes or exception class names, never exception text or task payloads.

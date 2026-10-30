@@ -37,6 +37,7 @@ Scope: this service creates and updates memory in Qdrant. That is all it does. I
 does no ranking beyond Qdrant's own vector search, no reasoning, and no scheduling.
 """
 import os
+import hashlib
 import json
 import math
 import re
@@ -47,9 +48,13 @@ from typing import Annotated, Any, Literal
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
-import profile_schema
-import episode
-from runtime_config import required, qdrant_headers
+if __package__:
+    from . import episode, profile_schema
+    from .runtime_config import required, qdrant_headers
+else:
+    import profile_schema
+    import episode
+    from runtime_config import required, qdrant_headers
 
 QDRANT_URL = required("QDRANT_URL").rstrip("/")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "amul_memory")
@@ -161,6 +166,30 @@ class NewEntry(BaseModel):
             "dotted paths (metadata.some_key) if a key turns out to be broadly useful."
         ),
     )
+
+
+class EpisodeSummaryRequest(BaseModel):
+    """System-owned summary for one numbered source conversation episode."""
+
+    model_config = ConfigDict(extra="forbid")
+    surface: Literal["chat", "voice"]
+    session_id: str = Field(
+        min_length=1, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    )
+    episode_number: int = Field(ge=1, le=2_147_483_647)
+    episode_revision: int = Field(ge=1, le=2_147_483_647)
+    episode_started_at: str = Field(min_length=1, max_length=64)
+    episode_ended_at: str = Field(min_length=1, max_length=64)
+    part_number: int = Field(ge=1, le=2_147_483_647)
+    part_count: int = Field(ge=1, le=2_147_483_647)
+    headline: str = Field(min_length=1, max_length=episode.SUMMARY_MAX_CHARS)
+    expanded: str = Field(min_length=1)
+    source_traces: list[Annotated[
+        str, Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+    ]] = Field(min_length=1, max_length=100)
+    pending_trace_ids: list[Annotated[
+        str, Field(min_length=1, max_length=200, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+    ]] = Field(min_length=1, max_length=100)
 
 
 class SearchRequest(BaseModel):
@@ -402,9 +431,11 @@ async def _ensure_collection() -> None:
     for field, schema in (
         ("farmer_id", "keyword"),
         ("type", "keyword"),
+        ("record_kind", "keyword"),
         ("status", "keyword"),
         ("source_ts", "datetime"),
         ("episode_id", "keyword"),
+        ("episode_subject_key", "keyword"),
         ("expires_at", "datetime"),
     ):
         await _qdrant("PUT", f"/collections/{COLLECTION}/index?wait=true",
@@ -526,8 +557,16 @@ async def add_entry(farmer_id: str, entry: NewEntry) -> dict:
     return await _store_entry(farmer_id, entry)
 
 
-async def _store_entry(farmer_id: str, entry: NewEntry, *,
-                       exclude_id: str | None = None, previous_version: str | None = None) -> dict:
+async def _store_entry(
+    farmer_id: str,
+    entry: NewEntry,
+    *,
+    exclude_id: str | None = None,
+    previous_version: str | None = None,
+    record_kind: Literal["matter", "episode"] = "matter",
+    system_fields: dict[str, Any] | None = None,
+    dedupe_headline: bool = True,
+) -> dict:
     """Version links are generated only by the checked update path, never POST input."""
     await _require_memory_enabled(farmer_id)
     sessions = sorted({s for s in (
@@ -547,7 +586,11 @@ async def _store_entry(farmer_id: str, entry: NewEntry, *,
             # not a duplicate of its own successor.
             continue
         pl = p["payload"]
-        if _norm_text(pl.get("headline") or "") == want:
+        if (
+            dedupe_headline
+            and pl.get("record_kind", "matter") == record_kind
+            and _norm_text(pl.get("headline") or "") == want
+        ):
             return {"id": p["id"], "payload": pl, "written": False,
                     "duplicate_of_existing": True,
                     "reason": "this farmer already holds an entry with the same headline"}
@@ -559,6 +602,7 @@ async def _store_entry(farmer_id: str, entry: NewEntry, *,
     payload = {
         "farmer_id": farmer_id,
         "type": MEMORY_TYPE,
+        "record_kind": record_kind,
         "status": entry.status,
         "headline": entry.headline,
         "expanded": entry.expanded,
@@ -595,9 +639,159 @@ async def _store_entry(farmer_id: str, entry: NewEntry, *,
         # boundary is about protecting the fields we filter on, not about migrations.
         "metadata": entry.metadata or {},
     }
+    payload.update(system_fields or {})
     if entry.chunk_size != episode.CHUNK_MAX_CHARS:
         raise HTTPException(422, "Writer and service chunk budgets differ; use the same MEMORY_CHUNK_MAX_CHARS")
     return await _store_layout(point_id, payload, entry.contents)
+
+
+def _episode_time(value: str, field: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(422, f"invalid {field}") from exc
+    if parsed.tzinfo is None:
+        raise HTTPException(422, f"{field} must include a timezone")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+async def _current_episode_summary(
+    farmer_id: str,
+    subject_key: str,
+) -> dict[str, Any] | None:
+    result = await _qdrant("POST", f"/collections/{COLLECTION}/points/scroll", {
+        "filter": {
+            "must": [
+                {"key": "farmer_id", "match": {"value": farmer_id}},
+                {"key": "record_kind", "match": {"value": "episode"}},
+                {"key": "episode_subject_key", "match": {"value": subject_key}},
+                {"is_empty": {"key": "superseded_at"}},
+            ]
+        },
+        "limit": 2,
+        "with_payload": True,
+        "with_vector": False,
+    })
+    points = result["result"]["points"]
+    if len(points) > 1:
+        raise HTTPException(409, "episode has multiple current summaries")
+    return points[0] if points else None
+
+
+@app.get(
+    "/internal/memory/{farmer_id}/episodes/{subject_key}",
+    include_in_schema=False,
+)
+async def get_episode_summary(farmer_id: str, subject_key: str) -> dict:
+    await _require_memory_enabled(farmer_id)
+    if not re.fullmatch(r"[0-9a-f]{64}", subject_key):
+        raise HTTPException(422, "invalid episode subject")
+    point = await _current_episode_summary(farmer_id, subject_key)
+    if point is None:
+        raise HTTPException(404, "episode summary not found")
+    return {"entry": _shape(point, include_private=True)}
+
+
+@app.put(
+    "/internal/memory/{farmer_id}/episodes/{subject_key}",
+    include_in_schema=False,
+)
+async def put_episode_summary(
+    farmer_id: str,
+    subject_key: str,
+    summary: EpisodeSummaryRequest,
+) -> dict:
+    """Create or advance one episode summary without exposing identity to the model."""
+    await _require_memory_enabled(farmer_id)
+    if not re.fullmatch(r"[0-9a-f]{64}", subject_key):
+        raise HTTPException(422, "invalid episode subject")
+    expected_subject = hashlib.sha256(
+        (
+            f"{farmer_id}\0{summary.surface}\0{summary.session_id}\0"
+            f"{summary.episode_number}"
+        ).encode("utf-8")
+    ).hexdigest()
+    if subject_key != expected_subject:
+        raise HTTPException(409, "episode subject does not match its identity")
+    if summary.part_number > summary.part_count:
+        raise HTTPException(422, "invalid episode part range")
+    started_at = _episode_time(summary.episode_started_at, "episode_started_at")
+    ended_at = _episode_time(summary.episode_ended_at, "episode_ended_at")
+    if started_at > ended_at:
+        raise HTTPException(422, "invalid episode time range")
+    traces = sorted(set(summary.source_traces))
+    pending = set(summary.pending_trace_ids)
+    if (
+        len(traces) != len(summary.source_traces)
+        or len(pending) != len(summary.pending_trace_ids)
+        or not pending.issubset(traces)
+    ):
+        raise HTTPException(422, "invalid episode trace provenance")
+
+    current = await _current_episode_summary(farmer_id, subject_key)
+    old = current["payload"] if current else None
+    old_revision = int((old or {}).get("episode_revision") or 0)
+    old_part = int((old or {}).get("episode_part_number") or 0)
+    old_traces = set((old or {}).get("source_traces") or [])
+
+    if old:
+        if summary.episode_revision < old_revision:
+            return {"id": current["id"], "applied": False, "unchanged": True}
+        if summary.episode_revision == old_revision:
+            if summary.part_count != old.get("episode_part_count"):
+                raise HTTPException(409, "episode part count changed within a revision")
+            if summary.part_number < old_part:
+                return {"id": current["id"], "applied": False, "unchanged": True}
+            if summary.part_number == old_part:
+                if set(traces).issubset(old_traces):
+                    return {"id": current["id"], "applied": False, "unchanged": True}
+                raise HTTPException(409, "episode part changed after it was recorded")
+            if summary.part_number != old_part + 1:
+                raise HTTPException(409, "episode parts must be applied in order")
+        elif (
+            summary.episode_revision != old_revision + 1
+            or summary.part_number != 1
+        ):
+            raise HTTPException(409, "episode revisions must be applied in order")
+    elif summary.episode_revision != 1 or summary.part_number != 1:
+        raise HTTPException(409, "episode must start at revision 1 part 1")
+
+    all_traces = sorted(old_traces | set(traces))
+    entry = NewEntry(
+        headline=summary.headline,
+        expanded=summary.expanded,
+        status="n/a",
+        source_session_id=summary.session_id,
+        source_sessions=[summary.session_id],
+        source_traces=all_traces,
+        source_ts=ended_at,
+        first_source_ts=(old or {}).get("first_source_ts") or started_at,
+    )
+    stored = await _store_entry(
+        farmer_id,
+        entry,
+        exclude_id=current["id"] if current else None,
+        previous_version=current["id"] if current else None,
+        record_kind="episode",
+        system_fields={
+            "episode_subject_key": subject_key,
+            "source_surface": summary.surface,
+            "source_episode_number": summary.episode_number,
+            "episode_revision": summary.episode_revision,
+            "episode_part_number": summary.part_number,
+            "episode_part_count": summary.part_count,
+            "episode_started_at": started_at,
+            "episode_ended_at": ended_at,
+        },
+        dedupe_headline=False,
+    )
+    if current:
+        await _retire(
+            current["id"],
+            old,
+            {"superseded_at": _now(), "superseded_by": stored["id"]},
+        )
+    return {"id": stored["id"], "applied": True, "unchanged": False}
 
 
 def _chunk_id(entry_id, number):
@@ -884,6 +1078,8 @@ async def update_entry(farmer_id: str, entry_id: str, update: UpdateEntry) -> di
 
     if old.get("superseded_at") or old.get("type") in INTERNAL_TYPES:
         raise HTTPException(409, "only a current memory can be updated")
+    if old.get("record_kind") == "episode":
+        raise HTTPException(409, "episode summaries use the internal episode endpoint")
 
     # Idempotency, enforced here rather than in a caller: this is the authority, and
     # the bugs that made it necessary all came from a rule living in one write path
@@ -956,7 +1152,13 @@ async def update_entry(farmer_id: str, entry_id: str, update: UpdateEntry) -> di
     #
     # So: write the replacement first, and only retire the old version once the new
     # one actually exists. A refused write now leaves the entry exactly as it was.
-    new = await _store_entry(farmer_id, merged, exclude_id=entry_id, previous_version=entry_id)
+    new = await _store_entry(
+        farmer_id,
+        merged,
+        exclude_id=entry_id,
+        previous_version=entry_id,
+        record_kind=old.get("record_kind", "matter"),
+    )
     if not new.get("written", True):
         return {"applied": False,
                 "reason": new.get("reason", "the replacement was refused"),
@@ -1051,6 +1253,8 @@ async def fold_entry(farmer_id: str, entry_id: str, req: FoldRequest) -> dict:
     source = points[0]["payload"]
     if source.get("superseded_at") or source.get("type") in INTERNAL_TYPES:
         raise HTTPException(409, "only a current memory can be folded")
+    if source.get("record_kind") == "episode":
+        raise HTTPException(409, "episode summaries cannot be folded")
     if entry_id == req.merged_into:
         raise HTTPException(400, "an entry cannot be folded into itself")
 
@@ -1064,6 +1268,8 @@ async def fold_entry(farmer_id: str, entry_id: str, req: FoldRequest) -> dict:
     destination = targets[0]["payload"]
     if destination.get("superseded_at") or destination.get("type") in INTERNAL_TYPES:
         raise HTTPException(409, "merge destination must be a current memory")
+    if destination.get("record_kind") == "episode":
+        raise HTTPException(409, "episode summaries cannot be fold destinations")
 
     now = _now()
     await _retire(entry_id, source, {"superseded_at": now, "merged_into": req.merged_into,
