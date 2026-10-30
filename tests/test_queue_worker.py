@@ -15,10 +15,18 @@ from tasks import (  # noqa: E402
 
 def task_body():
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "farmer_id": "9876543210",
+        "surface": "chat",
         "session_id": "session-1",
         "source": "current-chat-adapter",
+        "episode_number": 1,
+        "episode_revision": 1,
+        "episode_started_at": "2026-10-17T08:00:00Z",
+        "episode_ended_at": "2026-10-17T08:00:00Z",
+        "part_number": 1,
+        "part_count": 1,
+        "pending_trace_ids": ["trace-1"],
         "turns": [
             {
                 "trace_id": "trace-1",
@@ -68,20 +76,37 @@ class TestMemoryTask(unittest.TestCase):
         self.assertNotEqual(first.task_key, second.task_key)
         self.assertEqual(first.subject_key, second.subject_key)
 
-    def test_session_is_provenance_not_event_identity(self):
+    def test_episode_identity_includes_session_surface_and_number(self):
         first = MemoryTask.from_dict(task_body())
-        changed = task_body()
-        changed["session_id"] = "session-reopened-after-28-days"
-        second = MemoryTask.from_dict(changed)
-        self.assertNotEqual(first.task_key, second.task_key)
-        self.assertEqual(first.subject_key, second.subject_key)
+        for field, value in (
+            ("session_id", "session-2"),
+            ("surface", "voice"),
+            ("episode_number", 2),
+        ):
+            changed = task_body()
+            changed[field] = value
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    first.subject_key, MemoryTask.from_dict(changed).subject_key
+                )
 
-    def test_different_trace_has_a_different_subject(self):
+    def test_revision_part_and_turns_change_task_not_episode_subject(self):
         first = MemoryTask.from_dict(task_body())
-        changed = task_body()
-        changed["turns"][0]["trace_id"] = "trace-2"
-        second = MemoryTask.from_dict(changed)
-        self.assertNotEqual(first.subject_key, second.subject_key)
+        variants = []
+        revised = task_body()
+        revised["episode_revision"] = 2
+        variants.append(revised)
+        part = task_body()
+        part.update(part_number=2, part_count=2)
+        variants.append(part)
+        changed_trace = task_body()
+        changed_trace["turns"][0]["trace_id"] = "trace-2"
+        changed_trace["pending_trace_ids"] = ["trace-2"]
+        variants.append(changed_trace)
+        for body in variants:
+            task = MemoryTask.from_dict(body)
+            self.assertNotEqual(first.task_key, task.task_key)
+            self.assertEqual(first.subject_key, task.subject_key)
 
     def test_timestamps_are_canonical_before_hashing(self):
         variants = []
@@ -99,6 +124,7 @@ class TestMemoryTask(unittest.TestCase):
         body["turns"][0].update(trace_id="t" * MAX_TRACE_ID_CHARS,
                                 query="q" * MAX_QUERY_CHARS,
                                 answer="a" * MAX_ANSWER_CHARS)
+        body["pending_trace_ids"] = ["t" * MAX_TRACE_ID_CHARS]
         MemoryTask.from_dict(body)
         invalid = (
             ("farmer_id", " 9876543210"), ("farmer_id", "anonymous"),
@@ -113,22 +139,54 @@ class TestMemoryTask(unittest.TestCase):
             with self.subTest(field=field, value=value[:20]), self.assertRaises(TaskValidationError):
                 MemoryTask.from_dict(changed)
 
-    def test_turn_count_and_payload_limits(self):
+    def test_accepts_ordered_multi_turn_episode(self):
+        body = task_body()
+        body["episode_ended_at"] = "2026-10-17T08:20:00Z"
+        body["turns"].append({
+            "trace_id": "trace-2",
+            "timestamp": "2026-10-17T08:20:00Z",
+            "query": "She also has a fever",
+            "answer": "Please measure it and contact the veterinarian.",
+        })
+        body["pending_trace_ids"] = ["trace-1", "trace-2"]
+        task = MemoryTask.from_dict(body)
+        self.assertEqual(len(task.turns), 2)
+        self.assertEqual(task.pending_trace_ids, ("trace-1", "trace-2"))
+
+    def test_turn_count_and_pending_evidence_limits(self):
         body = task_body()
         MemoryTask.from_dict(body)
-        for turns in ([], [*body["turns"], copy.deepcopy(body["turns"][0])]):
+        for turns in ([], [copy.deepcopy(body["turns"][0])] * (MAX_TURNS + 1)):
             changed = task_body()
             changed["turns"] = turns
             with self.assertRaisesRegex(TaskValidationError, "invalid_turn_count"):
                 MemoryTask.from_dict(changed)
+        for pending, code in (
+            ([], "invalid_pending_trace_ids"),
+            (["trace-1", "trace-1"], "duplicate_pending_trace_id"),
+            (["trace-unknown"], "unknown_pending_trace_id"),
+        ):
+            changed = task_body()
+            changed["pending_trace_ids"] = pending
+            with self.subTest(code=code), self.assertRaises(TaskValidationError) as caught:
+                MemoryTask.from_dict(changed)
+            self.assertEqual(caught.exception.code, code)
 
     def test_rejects_malformed_tasks(self):
         def extra(body):
             body["telemetry_metadata"] = {}
 
         mutations = (
-            ("unsupported_schema_version", lambda body: body.__setitem__("schema_version", 2)),
+            ("unsupported_schema_version", lambda body: body.__setitem__("schema_version", 1)),
             ("invalid_task_fields", extra),
+            ("invalid_surface", lambda body: body.__setitem__("surface", "email")),
+            ("invalid_episode_number", lambda body: body.__setitem__("episode_number", 0)),
+            ("invalid_episode_revision", lambda body: body.__setitem__("episode_revision", 0)),
+            ("invalid_part_range", lambda body: body.update(part_number=2, part_count=1)),
+            ("invalid_episode_range", lambda body: body.update(
+                episode_started_at="2026-10-17T09:00:00Z",
+                episode_ended_at="2026-10-17T08:00:00Z",
+            )),
             ("invalid_turn_timestamp", lambda body: body["turns"][0].__setitem__("timestamp", "bad")),
             ("turn_timestamp_needs_timezone",
              lambda body: body["turns"][0].__setitem__("timestamp", "2026-10-17T08:00:00")),

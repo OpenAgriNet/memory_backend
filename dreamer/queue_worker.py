@@ -55,8 +55,8 @@ def consume_one(
     """Receive and handle at most one task.
 
     Delivery is at-least-once: acknowledgement can be lost after writes succeed.
-    The eventual processor must therefore use ``task_key`` and source trace IDs
-    to make its writes idempotent.
+    The eventual processor must therefore use the episode ``subject_key``, exact
+    ``task_key`` revision, and pending source trace IDs to make writes idempotent.
     """
     message = queue.receive()
     if message is None:
