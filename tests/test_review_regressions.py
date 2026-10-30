@@ -254,6 +254,38 @@ class TestReadPolicy(unittest.IsolatedAsyncioTestCase):
             self.assertIn({"key": "type", "match": {"value": kind}}, flt["must_not"])
 
 
+class TestWriteOptOut(unittest.IsolatedAsyncioTestCase):
+    async def test_every_farmer_write_path_stops_before_mutation_when_disabled(self):
+        calls = (
+            lambda: api._store_entry("9876543210", api.NewEntry(headline="memory")),
+            lambda: api.index_existing_episode("9876543210", "entry"),
+            lambda: api.update_entry("9876543210", "entry", api.UpdateEntry(headline="changed")),
+            lambda: api.fold_entry("9876543210", "entry", api.FoldRequest(merged_into="other")),
+            lambda: api.put_profile("9876543210", api.ProfileRecord(fields={})),
+        )
+        with patch.object(api, "_memory_enabled_strict", new_callable=AsyncMock, return_value=False), patch.object(
+                api, "_qdrant", new_callable=AsyncMock) as qdrant:
+            for call in calls:
+                with self.subTest(call=call), self.assertRaises(api.HTTPException) as error:
+                    await call()
+                self.assertEqual(error.exception.status_code, 403)
+            qdrant.assert_not_called()
+
+    async def test_write_and_settings_endpoint_fail_closed_when_lookup_is_unavailable(self):
+        failure = api.HTTPException(503, "qdrant unavailable")
+        with patch.object(api, "_memory_enabled_strict", new_callable=AsyncMock,
+                          side_effect=failure), patch.object(
+                api, "_qdrant", new_callable=AsyncMock) as qdrant:
+            for call in (
+                lambda: api._store_entry("9876543210", api.NewEntry(headline="memory")),
+                lambda: api.get_settings("9876543210"),
+            ):
+                with self.subTest(call=call), self.assertRaises(api.HTTPException) as error:
+                    await call()
+                self.assertEqual(error.exception.status_code, 503)
+            qdrant.assert_not_called()
+
+
 class TestPublicBoundaries(unittest.IsolatedAsyncioTestCase):
     async def test_public_metadata_cannot_expose_private_alias(self):
         import httpx

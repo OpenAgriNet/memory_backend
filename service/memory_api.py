@@ -471,24 +471,35 @@ def _settings_point_id(farmer_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"amul-memory-settings:{farmer_id}"))
 
 
-async def _memory_enabled(farmer_id: str) -> bool:
-    """Default on for now; stored false disables reply use for this farmer.
-
-    A failed lookup or malformed stored value never overrides an explicit off.
-    Only the settings endpoint writes this record; the dreamer leaves it alone.
-    """
-    try:
-        got = await _qdrant(
-            "POST",
-            f"/collections/{COLLECTION}/points",
-            {"ids": [_settings_point_id(farmer_id)], "with_payload": True},
-        )
-    except (HTTPException, httpx.HTTPError):
-        return False
+async def _memory_enabled_strict(farmer_id: str) -> bool:
+    """Read the authoritative setting; callers decide how lookup failure is handled."""
+    got = await _qdrant(
+        "POST",
+        f"/collections/{COLLECTION}/points",
+        {"ids": [_settings_point_id(farmer_id)], "with_payload": True},
+    )
     points = got.get("result") or []
     if not points:
         return DEFAULT_MEMORY_ENABLED
     return points[0].get("payload", {}).get("memory_enabled", DEFAULT_MEMORY_ENABLED) is True
+
+
+async def _memory_enabled(farmer_id: str) -> bool:
+    """Fail closed for reply reads when the authoritative setting is unavailable."""
+    try:
+        return await _memory_enabled_strict(farmer_id)
+    except (HTTPException, httpx.HTTPError):
+        return False
+
+
+async def _require_memory_enabled(farmer_id: str) -> None:
+    """Guard every farmer-memory mutation at the storage authority."""
+    try:
+        enabled = await _memory_enabled_strict(farmer_id)
+    except (HTTPException, httpx.HTTPError) as exc:
+        raise HTTPException(503, "memory setting unavailable") from exc
+    if not enabled:
+        raise HTTPException(403, "memory is disabled for this farmer")
 
 
 # ---------- endpoints ----------
@@ -518,6 +529,7 @@ async def add_entry(farmer_id: str, entry: NewEntry) -> dict:
 async def _store_entry(farmer_id: str, entry: NewEntry, *,
                        exclude_id: str | None = None, previous_version: str | None = None) -> dict:
     """Version links are generated only by the checked update path, never POST input."""
+    await _require_memory_enabled(farmer_id)
     sessions = sorted({s for s in (
         (entry.source_sessions or []) + [entry.source_session_id]) if s})
     traces = sorted({t for t in (entry.source_traces or []) if t})
@@ -627,6 +639,7 @@ async def _retire(entry_id, old, changes):
 @app.post("/internal/memory/{farmer_id}/entries/{entry_id}/index", include_in_schema=False)
 async def index_existing_episode(farmer_id: str, entry_id: str):
     """Explicit background index upgrade. Preserve text, dates, history and settings."""
+    await _require_memory_enabled(farmer_id)
     got = await _qdrant("POST", f"/collections/{COLLECTION}/points", {"ids": [entry_id], "with_payload": True})
     points = got.get("result") or []
     if not points or points[0]["payload"].get("farmer_id") != farmer_id:
@@ -856,6 +869,7 @@ async def _read_entry(farmer_id: str, entry_id: str, include_private: bool = Tru
 async def update_entry(farmer_id: str, entry_id: str, update: UpdateEntry) -> dict:
     """Update = write a new version, then retire the old one, so the history of how a
     fact changed is never lost AND a refused write leaves the entry untouched."""
+    await _require_memory_enabled(farmer_id)
     got = await _qdrant(
         "POST",
         f"/collections/{COLLECTION}/points",
@@ -1026,6 +1040,7 @@ async def fold_entry(farmer_id: str, entry_id: str, req: FoldRequest) -> dict:
     Nothing is deleted: the trail from a merged episode back to what it was built from
     has to survive, or a wrong merge becomes impossible to diagnose.
     """
+    await _require_memory_enabled(farmer_id)
     got = await _qdrant("POST", f"/collections/{COLLECTION}/points",
                         {"ids": [entry_id], "with_payload": True})
     points = got.get("result") or []
@@ -1093,7 +1108,11 @@ async def put_settings(farmer_id: str, settings: MemorySettings) -> dict:
 
 @app.get("/memory/{farmer_id}/settings")
 async def get_settings(farmer_id: str) -> dict:
-    return {"farmer_id": farmer_id, "memory_enabled": await _memory_enabled(farmer_id)}
+    try:
+        enabled = await _memory_enabled_strict(farmer_id)
+    except (HTTPException, httpx.HTTPError) as exc:
+        raise HTTPException(503, "memory setting unavailable") from exc
+    return {"farmer_id": farmer_id, "memory_enabled": enabled}
 
 
 @app.get("/settings")
@@ -1396,6 +1415,7 @@ async def put_profile(farmer_id: str, rec: ProfileRecord) -> dict:
     Only the fields with content are stored, so the block injected into a turn stays
     as short as what is actually known.
     """
+    await _require_memory_enabled(farmer_id)
     try:
         kept = profile_schema.validate(rec.fields)
     except ValueError as exc:
