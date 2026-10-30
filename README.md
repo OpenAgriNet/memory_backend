@@ -83,7 +83,8 @@ model. Keep the service's writes and internal routes restricted to trusted calle
 the service itself does not implement end-user authentication.
 
 Queue tasks are normalized before they reach the worker. `process_task` handles one
-source event at a time and records only hashed progress in `QDRANT_TASK_STATE_COLLECTION`.
+ordered episode part/revision at a time and records only hashed progress in
+`QDRANT_TASK_STATE_COLLECTION`.
 Claims persist a lease owner and expiry. Active leases defer redelivery; an expired
 claim can be taken over only when no write tool had started. A crash after write work
 started becomes `needs_review`, and replay requires the explicit
@@ -91,9 +92,12 @@ started becomes `needs_review`, and replay requires the explicit
 There is deliberately no renewal thread or retry schedule here; the queue owns retry
 timing.
 
-Source events are immutable. Reusing a trace ID with changed content sends the task to
-review; it is never checkpointed as a successful correction. Each task contains only
-that event, so later activity in the same session cannot replay earlier evidence.
+Source turns are immutable. Reusing a trace ID with changed content sends the task to
+review; it is never checkpointed as a successful correction. Dreamer receives every
+turn in the bounded episode part for context, while deterministic tool checks allow
+ordinary memory mutations only when their evidence includes a newly pending trace.
+Every processed part/revision rewrites one system-owned episode summary; prior
+summaries are supplied when a later part or revision must preserve earlier context.
 `python -m dreamer.worker <task.json>`
 is the supported one-task composition for local/integration use; a later producer PR
 supplies the real broker adapter and telemetry event discovery.
@@ -224,7 +228,7 @@ schedule, and deployment configuration are also later integration/deployment wor
 they are not implemented by this queue boundary.
 
 Delivery is at-least-once. A task can be delivered again after writes succeed but
-before acknowledgement, so the future processor must use the episode subject key,
+before acknowledgement, so the processor uses the episode subject key,
 exact task revision and pending source trace IDs for idempotency. Retry and
 dead-letter reasons contain only fixed error
 codes or exception class names, never exception text or task payloads.

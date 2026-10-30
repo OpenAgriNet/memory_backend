@@ -30,7 +30,8 @@ class Ctx:
     """What the agent is working on. Not visible to the model."""
 
     def __init__(self, api, farmer_id, turns=None, source_ts=None, session_id=None,
-                 known_keys=(), dry_run=False, trace_ids=None, before_mutation=None):
+                 known_keys=(), dry_run=False, trace_ids=None, before_mutation=None,
+                 pending_trace_ids=None, episode=None):
         self.api = api.rstrip("/")
         self.farmer_id = str(farmer_id)
         self.turns = turns or []
@@ -42,6 +43,11 @@ class Ctx:
         # idempotency: the service refuses an update whose traces it has already
         # recorded, so re-running the job over the same window is a no-op.
         self.trace_ids = list(trace_ids or [t.get("trace_id") for t in (turns or [])])
+        self.pending_trace_ids = set(
+            self.trace_ids if pending_trace_ids is None else pending_trace_ids
+        )
+        self.episode = dict(episode or {})
+        self.episode_summary_written = False
         self.writes: list[dict] = []      # what actually happened, for the caller
         self.blocked: list[dict] = []     # what the judges refused, and why
         # Worker-only outcome signals.  They contain no exception text, and leave
@@ -74,6 +80,10 @@ class Ctx:
         selected = copy(self)
         selected.turns = [self.turns[n - 1] for n in sorted(set(numbers))]
         selected.trace_ids = [t["trace_id"] for t in selected.turns if t.get("trace_id")]
+        if not self.pending_trace_ids.intersection(selected.trace_ids):
+            raise ValueError(
+                "source_turns must include at least one newly pending turn"
+            )
         stamps = sorted(t["ts"] for t in selected.turns if t.get("ts"))
         selected.source_ts = stamps[-1] if stamps else None
         selected.session_id = selected.turns[-1].get("session_id")
@@ -99,7 +109,8 @@ def search_memory(ctx: Ctx, query: str, detail: bool = False, limit: int = 8, me
     r.raise_for_status()
     hits = r.json().get("hits", [])
     return {"found": len(hits), "entries": [{
-        "entry_id": h["id"], "status": h.get("status"),
+        "entry_id": h["id"], "record_kind": h.get("record_kind", "matter"),
+        "status": h.get("status"),
         "times_raised": h.get("times_raised"),
         "first_came_up": dates.fmt(h.get("first_source_ts")),
         "last_mentioned": dates.fmt(h.get("source_ts")),
@@ -133,7 +144,8 @@ def list_memory(ctx: Ctx, status: str | None = None,
     return {"found": len(ents), "truncated": bool(body.get("truncated")),
             "next_cursor": body.get("next_cursor"),
             "note": "Only recorded values matching the filter; not proof that nothing else happened.", "entries": [{
-        "entry_id": e["id"], "status": e.get("status"),
+        "entry_id": e["id"], "record_kind": e.get("record_kind", "matter"),
+        "status": e.get("status"),
         "times_raised": e.get("times_raised"),
         "first_came_up": dates.fmt(e.get("first_source_ts")),
         "last_mentioned": dates.fmt(e.get("source_ts")),
@@ -179,6 +191,56 @@ def write_memory(ctx: Ctx, headline: str, expanded: str = "",
     return {"written": res.pop("ok"), **res}
 
 
+def write_episode_summary(ctx: Ctx, headline: str, expanded: str) -> dict:
+    """Create or revise the system-owned summary for this conversation episode."""
+    if not ctx.episode or not ctx.pending_trace_ids:
+        return {"written": False, "error": "episode_context_unavailable"}
+    if ctx.episode_summary_written:
+        return {"written": False, "error": "episode_summary_already_written"}
+    body = {
+        "surface": ctx.episode["surface"],
+        "session_id": ctx.session_id,
+        "episode_number": ctx.episode["number"],
+        "episode_revision": ctx.episode["revision"],
+        "episode_started_at": ctx.episode["started_at"],
+        "episode_ended_at": ctx.episode["ended_at"],
+        "part_number": ctx.episode["part_number"],
+        "part_count": ctx.episode["part_count"],
+        "headline": headline,
+        "expanded": expanded,
+        "source_traces": sorted(
+            trace_id for trace_id in ctx.trace_ids if trace_id
+        ),
+        "pending_trace_ids": sorted(ctx.pending_trace_ids),
+    }
+    if ctx.dry_run:
+        ctx.episode_summary_written = True
+        ctx.writes.append({"action": "would-write-episode", "entry": body})
+        return {"written": True, "dry_run": True}
+    try:
+        response = requests.put(
+            ctx._url(f"/episodes/{ctx.episode['subject_key']}"),
+            json=body,
+            timeout=90,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except Exception as exc:  # noqa: BLE001
+        return {"written": False, "error": str(exc)[:200]}
+    ctx.episode_summary_written = True
+    if result.get("applied"):
+        ctx.writes.append({
+            "action": "episode",
+            "entry_id": result.get("id"),
+            "entry": body,
+        })
+    return {
+        "written": True,
+        "entry_id": result.get("id"),
+        "unchanged": bool(result.get("unchanged")),
+    }
+
+
 def update_memory(ctx: Ctx, entry_id: str, headline: str, expanded: str | None = None,
                   status: str | None = None, metadata: dict | None = None,
                   source_turns: list[int] | None = None) -> dict:
@@ -191,7 +253,12 @@ def update_memory(ctx: Ctx, entry_id: str, headline: str, expanded: str | None =
     return {"updated": res.pop("ok"), **res}
 
 
-def fold_memory(ctx: Ctx, entry_id: str, merged_into: str, reason: str) -> dict:
+def fold_memory(ctx: Ctx, entry_id: str, merged_into: str, reason: str,
+                source_turns: list[int] | None = None) -> dict:
+    try:
+        ctx = ctx.for_sources(source_turns)
+    except ValueError as exc:
+        return {"folded": False, "error": str(exc)}
     if entry_id == merged_into:
         return {"folded": False, "error": "an entry cannot be folded into itself"}
     res = writer.apply(ctx, {"op": "fold", "entry_id": entry_id,
@@ -199,7 +266,12 @@ def fold_memory(ctx: Ctx, entry_id: str, merged_into: str, reason: str) -> dict:
     return {"folded": res.pop("ok"), **res}
 
 
-def document_key(ctx: Ctx, key: str, description: str) -> dict:
+def document_key(ctx: Ctx, key: str, description: str,
+                 source_turns: list[int] | None = None) -> dict:
+    try:
+        ctx.for_sources(source_turns)
+    except ValueError as exc:
+        return {"documented": False, "error": str(exc)}
     if ctx.dry_run:
         return {"documented": True, "dry_run": True}
     try:
@@ -213,6 +285,8 @@ def document_key(ctx: Ctx, key: str, description: str) -> dict:
 
 def nothing_to_remember(ctx: Ctx, why: str) -> dict:
     """Record why these turns add no useful supported memory."""
+    if ctx.episode and not ctx.episode_summary_written:
+        return {"acknowledged": False, "error": "episode_summary_required"}
     if ctx.tool_failures:
         return {"acknowledged": False, "error": "earlier_tool_failure"}
     ctx.writes.append({"action": "nothing", "notes": [why]})
@@ -262,6 +336,13 @@ SCHEMAS = [
          "expires_at": {"type": "string", "description": "ISO date, only when a real end date is knowable (a milk withdrawal period, a deadline)."},
          "metadata": {"type": "object", "description": "Extra filterable detail. An animal's ear tag goes here under animal_id and NEVER in the text."}},
         ["headline", "status", "source_turns"]),
+    _fn("write_episode_summary",
+        "Write the required summary of this numbered conversation episode. Call "
+        "this exactly once. Rewrite the complete summary when earlier episode "
+        "context is provided; do not list unrelated standing facts.",
+        {"headline": {"type": "string", "description": "A concise description of what this conversation discussed."},
+         "expanded": {"type": "string", "description": "A faithful chronological account of the discussion, advice, decisions and unresolved points."}},
+        ["headline", "expanded"]),
     _fn("update_memory",
         "Update an existing memory because this conversation moved it along. Use this "
         "rather than writing a second entry about the same situation. The previous "
@@ -276,24 +357,27 @@ SCHEMAS = [
     _fn("fold_memory",
         "Retire a duplicate entry into another that now covers it, when you find two "
         "entries recording the same situation. Nothing is deleted.",
-        {"entry_id": {"type": "string", "description": "The duplicate to retire."},
+        {"source_turns": {"type": "array", "items": {"type": "integer"}, "description": "Numbers of the new-evidence turns that revealed this duplication."},
+         "entry_id": {"type": "string", "description": "The duplicate to retire."},
          "merged_into": {"type": "string", "description": "The entry that now covers it."},
          "reason": {"type": "string"}},
-        ["entry_id", "merged_into", "reason"]),
+        ["entry_id", "merged_into", "reason", "source_turns"]),
     _fn("document_key",
         "Record what a metadata key you have just invented means, so later runs reuse "
         "it instead of coining a synonym.",
-        {"key": {"type": "string"}, "description": {"type": "string"}},
-        ["key", "description"]),
+        {"source_turns": {"type": "array", "items": {"type": "integer"}, "description": "Numbers of the new-evidence turns supporting use of this key."},
+         "key": {"type": "string"}, "description": {"type": "string"}},
+        ["key", "description", "source_turns"]),
     _fn("nothing_to_remember",
-        "Call this when these turns add no useful supported memory. Explain why; "
-        "do not assume either writing or skipping is the expected outcome.",
+        "Call this after write_episode_summary when these turns add no separate "
+        "stable fact or ongoing matter. Explain why.",
         {"why": {"type": "string"}}, ["why"]),
 ]
 
 IMPL = {
     "search_memory": search_memory, "list_memory": list_memory, "read_memory": read_memory, "known_keys": known_keys,
-    "write_memory": write_memory, "update_memory": update_memory, "fold_memory": fold_memory,
+    "write_memory": write_memory, "write_episode_summary": write_episode_summary,
+    "update_memory": update_memory, "fold_memory": fold_memory,
     "document_key": document_key, "nothing_to_remember": nothing_to_remember,
 }
 

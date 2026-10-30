@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import hashlib
 import os
 import subprocess
 import sys
@@ -24,15 +25,23 @@ from tasks import MemoryTask  # noqa: E402
 from worker import run_one  # noqa: E402
 
 
-def task(trace_index=0):
+def task(trace_index=0, *, episode_number=1, revision=1,
+         part_number=1, part_count=1, turns=None, pending=None):
+    indexes = list(turns if turns is not None else [trace_index])
+    pending_indexes = list(pending if pending is not None else indexes)
     return MemoryTask.from_dict({
-        "schema_version": 1, "farmer_id": "9876543210",
+        "schema_version": 2, "farmer_id": "9876543210", "surface": "chat",
         "session_id": "session-1", "source": "chat-main",
+        "episode_number": episode_number, "episode_revision": revision,
+        "episode_started_at": "2026-10-17T08:00:00Z",
+        "episode_ended_at": f"2026-10-17T08:{max(indexes):02d}:00Z",
+        "part_number": part_number, "part_count": part_count,
+        "pending_trace_ids": [f"trace-{index}" for index in pending_indexes],
         "turns": [{
-            "trace_id": f"trace-{trace_index}",
-            "timestamp": f"2026-10-17T08:0{trace_index}:00Z",
-            "query": f"question {trace_index}", "answer": f"answer {trace_index}",
-        }],
+            "trace_id": f"trace-{index}",
+            "timestamp": f"2026-10-17T08:{index:02d}:00Z",
+            "query": f"question {index}", "answer": f"answer {index}",
+        } for index in indexes],
     })
 
 
@@ -95,18 +104,21 @@ class TestProcessor(unittest.TestCase):
                                               settings_check=check).outcome, "no_op")
                 self.assertNotIn("writing", state.actions)
 
-    def test_runner_receives_only_the_source_event(self):
-        event = task()
-        state = FakeState(BeginResult("started"))
+    def test_runner_receives_full_episode_and_marks_only_new_evidence(self):
+        event = task(turns=[0, 1], pending=[1], revision=2)
+        state = FakeState(BeginResult("started", (processed_turn(event.turns[0]),)))
         seen = []
         def runner(_task, chunks, _before):
             seen.extend(chunks)
             return 0
         process_task(event, state, runner=runner, settings_check=lambda _: True)
-        self.assertEqual([[row["trace_id"] for row in chunk] for chunk in seen], [["trace-0"]])
+        self.assertEqual(
+            [[(row["trace_id"], row["pending"]) for row in chunk] for chunk in seen],
+            [[("trace-0", False), ("trace-1", True)]],
+        )
 
-    def test_two_events_in_one_session_have_independent_state(self):
-        first, second = task(0), task(1)
+    def test_numbered_episodes_in_one_session_have_independent_state(self):
+        first, second = task(0), task(1, episode_number=2)
         self.assertEqual(first.session_id, second.session_id)
         self.assertNotEqual(first.subject_key, second.subject_key)
         for value in (first, second):
@@ -115,6 +127,13 @@ class TestProcessor(unittest.TestCase):
                 value, state, runner=lambda *_: 0, settings_check=lambda _: True
             )
             self.assertEqual(result.outcome, "no_op")
+
+    def test_undeclared_new_turn_requires_review(self):
+        value = task(turns=[0, 1], pending=[1], revision=2)
+        state = FakeState(BeginResult("started"))
+        with self.assertRaises(PermanentTaskError):
+            process_task(value, state, runner=lambda *_: 0, settings_check=lambda _: True)
+        self.assertIn(("fail", "needs_review"), state.actions)
 
     def test_changed_content_under_same_trace_requires_review(self):
         original = task()
@@ -162,6 +181,33 @@ class TestAgentFailures(unittest.TestCase):
         self.assertFalse(results[1]["acknowledged"])
         self.assertFalse(any(row.get("action") == "nothing" for row in ctx.writes))
 
+    def test_episode_summary_is_required_once_and_stable_writes_need_new_evidence(self):
+        turns = [
+            {"trace_id": "old", "ts": "2026-10-17T08:00:00Z", "query": "old", "answer": "old"},
+            {"trace_id": "new", "ts": "2026-10-17T08:01:00Z", "query": "new", "answer": "new"},
+        ]
+        ctx = agent.tools.Ctx(
+            "http://unused", "9876543210", turns=turns, session_id="session-1",
+            pending_trace_ids={"new"}, dry_run=True,
+            episode={
+                "subject_key": hashlib.sha256(b"episode").hexdigest(),
+                "surface": "chat", "number": 1, "revision": 1,
+                "started_at": turns[0]["ts"], "ended_at": turns[-1]["ts"],
+                "part_number": 1, "part_count": 1,
+            },
+        )
+        self.assertIn(
+            "newly pending",
+            agent.tools.write_memory(ctx, "old only", source_turns=[1])["error"],
+        )
+        self.assertFalse(agent.tools.nothing_to_remember(ctx, "none")["acknowledged"])
+        self.assertTrue(agent.tools.write_episode_summary(ctx, "discussion", "detail")["written"])
+        self.assertEqual(
+            agent.tools.write_episode_summary(ctx, "again", "again")["error"],
+            "episode_summary_already_written",
+        )
+        self.assertTrue(agent.tools.nothing_to_remember(ctx, "no stable fact")["acknowledged"])
+
 
 class TestLeases(unittest.TestCase):
     def setUp(self):
@@ -188,6 +234,31 @@ class TestLeases(unittest.TestCase):
         self.clock[0] += dt.timedelta(seconds=31)
         self.assertEqual(self.store().begin(task()).outcome, "needs_review")
         self.assertEqual(self.backing[task().subject_key]["status"], "needs_review")
+
+    def test_parts_and_revisions_are_claimed_in_order(self):
+        store = self.store()
+        first = task(0, part_number=1, part_count=2)
+        second = task(1, part_number=2, part_count=2)
+        self.assertEqual(store.begin(second).outcome, "deferred")
+        self.assertEqual(store.begin(first).outcome, "started")
+        store.complete(first, "completed", [processed_turn(first.turns[0])])
+        self.assertEqual(store.begin(second).outcome, "started")
+        store.complete(second, "completed", [
+            processed_turn(first.turns[0]), processed_turn(second.turns[0]),
+        ])
+
+        revision = task(turns=[0, 1, 2], pending=[2], revision=2)
+        self.assertEqual(store.begin(revision).outcome, "started")
+
+    def test_changed_completed_part_requires_review(self):
+        store = self.store()
+        original = task()
+        self.assertEqual(store.begin(original).outcome, "started")
+        store.complete(original, "completed", [processed_turn(original.turns[0])])
+        body = original.to_dict()
+        body["turns"][0]["answer"] = "changed"
+        changed = MemoryTask.from_dict(body)
+        self.assertEqual(store.begin(changed).outcome, "needs_review")
 
     def test_administrative_recovery_requires_explicit_confirmation(self):
         first = self.store()

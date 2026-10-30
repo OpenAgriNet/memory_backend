@@ -38,7 +38,8 @@ MAX_STEPS = int(__import__("os").environ.get("DREAMER_AGENT_STEPS", "8"))
 
 SYSTEM = """You maintain the long-term memory of Sarlaben, Amul's assistant for dairy farmers in Gujarat.
 
-You are given a short run of turns from one farmer's conversations, and tools to read and write what is remembered about them. Bring their memory up to date.
+You are given trusted conversation turns and tools to read and write what is
+remembered about the farmer. Bring their memory up to date.
 
 HOW TO WORK
 
@@ -46,7 +47,16 @@ Look before you write. Search what is already remembered — more than once, wit
 
 Before rewriting an existing account, use read_memory to inspect its detail, following the returned continuation when present. Search previews may be incomplete.
 
-For every write or update, provide source_turns: the numbers of only the turns supporting that situation. Dates, source links, and session counts are derived by code. Never attach unrelated turns.
+Search results can include record_kind=episode summaries. They are conversation
+history, not stable farmer facts. Never update or fold them with the ordinary memory
+tools; write_episode_summary is the only tool that may revise the current episode.
+
+For every ordinary memory write, update, fold, or key documentation, provide
+source_turns: the numbers of only the turns supporting that mutation. At least one
+must be marked NEW EVIDENCE;
+EARLIER CONTEXT can explain it but cannot independently cause another mutation.
+Dates, source links, and session counts are derived by code. Never attach unrelated
+turns.
 
 Then decide, for each thing worth remembering:
 - Already on record and this conversation moved it along -> update_memory. This is the case you should be actively looking for.
@@ -67,6 +77,17 @@ ANIMAL IDENTIFIERS: an ear tag may be stored in metadata under animal_id, so the
 METADATA KEYS: check known_keys before inventing one, and reuse an existing key if it fits even if you would have phrased it differently. Two keys meaning the same thing make both useless for filtering. If you do invent one, document_key it.
 
 When you are done, say in one short line what you did. Do not call any more tools after that.""".replace("[USEFULNESS_RULE]", prompts.USEFULNESS_RULE)
+
+EPISODE_SYSTEM = """EPISODE MODE
+
+These turns are one numbered conversation episode, or one bounded part/revision of
+it. Call write_episode_summary exactly once. It records what this conversation
+discussed, not a standing fact. If an earlier episode summary is shown, rewrite the
+complete summary using it plus the new evidence; do not discard earlier parts. The
+program owns episode identity and provenance.
+
+When no stable fact or ongoing matter should be changed, still write the episode
+summary, then call nothing_to_remember with a specific reason."""
 
 
 def _run_tools(ctx, calls):
@@ -115,25 +136,42 @@ def _run_tools(ctx, calls):
 
 def dream(api, farmer_id, turns, *, source_ts=None, session_id=None,
           known_keys=(), dry_run=False, verbose=True, trace_ids=None,
-          before_mutation=None):
+          before_mutation=None, pending_trace_ids=None, episode=None,
+          previous_episode_summary=None):
     """Run the agent over one chunk of turns. Returns the Ctx, which records
     everything written and everything the judges refused."""
     ctx = tools.Ctx(api, farmer_id, turns=turns, source_ts=source_ts,
                     session_id=session_id, known_keys=known_keys, dry_run=dry_run,
-                    trace_ids=trace_ids, before_mutation=before_mutation)
+                    trace_ids=trace_ids, before_mutation=before_mutation,
+                    pending_trace_ids=pending_trace_ids, episode=episode)
 
     convo = "\n\n".join(
-        f"Turn {n} [{(t.get('ts') or '')[:10]}] FARMER: {t['query']}\nASSISTANT: {t.get('answer') or ''}"
+        f"Turn {n} [{'NEW EVIDENCE' if t.get('pending') else 'EARLIER CONTEXT'}] "
+        f"[{(t.get('ts') or '')[:10]}] FARMER: {t['query']}\n"
+        f"ASSISTANT: {t.get('answer') or ''}"
         for n, t in enumerate(turns, 1) if (t.get("query") or "").strip()
     )
     keys = "\n".join(f"- {k['key']}: {k.get('description') or '(undocumented)'}"
                      for k in ctx.known_keys) or "(none yet)"
+    previous = "(none; this is the first part of the episode)"
+    if previous_episode_summary:
+        previous = (
+            f"Headline: {previous_episode_summary.get('headline') or ''}\n"
+            f"Detail: {previous_episode_summary.get('expanded') or ''}"
+        )
+    schemas = tools.SCHEMAS if episode else [
+        schema for schema in tools.SCHEMAS
+        if schema["function"]["name"] != "write_episode_summary"
+    ]
     messages = [
-        {"role": "system", "content": SYSTEM},
+        {"role": "system", "content": SYSTEM + ("\n\n" + EPISODE_SYSTEM if episode else "")},
         {"role": "user", "content": f"""Farmer: ...{str(farmer_id)[-4:]}
 
 METADATA KEYS ALREADY IN USE:
 {keys}
+
+PREVIOUS EPISODE SUMMARY:
+{previous}
 
 TURNS:
 {convo}
@@ -142,7 +180,7 @@ TURNS:
 
     for step in range(MAX_STEPS):
         try:
-            msg = llm.chat(messages, tools=tools.SCHEMAS, max_tokens=1500)
+            msg = llm.chat(messages, tools=schemas, max_tokens=1500)
         except Exception as exc:  # noqa: BLE001
             ctx.error_code = "agent_model_failed"
             if verbose:
