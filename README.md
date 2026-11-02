@@ -89,7 +89,8 @@ model. Every Memory API route requires
 authentication. Keep network access restricted to trusted callers as a second layer.
 
 Queue tasks are normalized before they reach the worker. `process_task` handles one
-session at a time and records only hashed progress in `QDRANT_TASK_STATE_COLLECTION`.
+ordered episode part/revision at a time and records only hashed progress in
+`QDRANT_TASK_STATE_COLLECTION`.
 Claims persist a lease owner and expiry. Active leases defer redelivery; an expired
 claim can be taken over only when no write tool had started. A crash after write work
 started becomes `needs_review`, and replay requires the explicit
@@ -98,11 +99,14 @@ There is deliberately no renewal thread or retry schedule here; the queue owns r
 timing.
 
 Source turns are immutable. Reusing a trace ID with changed content sends the task to
-review; it is never checkpointed as a successful correction. Previously processed
-turns are not replayed as writable evidence: late arrivals are passed to the model by
-themselves in chronological pending-only chunks. `python -m dreamer.worker <task.json>`
-is the supported one-task composition for local/integration use. The closed-session
-producer and Redis Streams worker are described below.
+review; it is never checkpointed as a successful correction. Dreamer receives every
+turn in the bounded episode part for context, while deterministic tool checks allow
+ordinary memory mutations only when their evidence includes a newly pending trace.
+Every processed part/revision rewrites one system-owned episode summary; prior
+summaries are supplied when a later part or revision must preserve earlier context.
+`python -m dreamer.worker <task.json>` is the supported one-task composition for
+local/integration use. The conversation-episode producer and Redis Streams worker are
+described below.
 
 The background agent proposes changes through `writer.apply`. Failed or malformed
 checks retry once, then block saving and report the proposal for retry. The standing
@@ -187,11 +191,15 @@ never copied into memory or these docs. Langfuse access is read-only.
 ### Queue worker boundary
 
 New background orchestration must adapt source telemetry into the normalized
-`dreamer.tasks.MemoryTask` contract before enqueueing it. The queue worker never
-reads Langfuse field names directly. A task contains one farmer/session,
-chronological turns, a source label, and a schema version. It derives opaque task
-and subject keys for idempotency and safe logging without exposing farmer IDs or
-conversation text.
+`dreamer.tasks.MemoryTask` v2 contract before enqueueing it. The queue worker never
+reads Langfuse field names directly. A task contains one bounded part of a completed,
+numbered conversation episode: its farmer, chat/voice surface, source session,
+episode number and revision, episode bounds, ordered turns, and the trace IDs that
+are new in this revision. It derives an exact-payload task key and a stable
+farmer/surface/session/episode subject key for idempotency and safe logging without
+exposing farmer IDs or conversation text. Reopening the same source session later
+uses a new immutable episode number; revisions and bounded parts retain the same
+episode subject.
 
 The contract accepts only a canonical 10-digit farmer mobile. It does not trim or
 repair identities and rejects anonymous, path-like, oversized, or otherwise invalid
@@ -199,12 +207,15 @@ values. The producer owns the trust decision before creating that task. The curr
 adapter uses the fields available on main and applies the extra identity/persona
 matching described below; its remaining authentication limitation is explicit.
 
-Tasks are bounded before model work: at most 256 KiB of canonical UTF-8 JSON, 100
-turns, 8,000 query characters, 16,000 answer characters, and 128,000 aggregate
-query/answer characters. Session and trace identifiers are bounded to 200 safe
-identifier characters; source labels are allowlisted and bounded to 64. Timestamps
-are normalized to UTC before keys are calculated. Log summaries hash the source
-label rather than emitting it.
+Tasks are bounded before model work: 1–100 chronologically ordered turns, at most
+256 KiB of canonical UTF-8 JSON, 8,000 query characters per turn, 16,000 answer
+characters per turn, and 128,000 aggregate query/answer characters. Larger episodes
+must be split by the producer into ordered parts under the same episode number.
+Pending trace IDs must be a non-empty subset of that part's turns. Session and trace
+identifiers are bounded to 200 safe characters; source labels are allowlisted and
+bounded to 64. Episode/turn timestamps are normalized to UTC before keys are
+calculated. Log summaries hash the source label and omit the session, farmer and
+conversation text.
 
 `dreamer.queue_worker.consume_one` defines the broker boundary: receive,
 acknowledge, retry, and dead-letter. It acknowledges only after processing
@@ -214,27 +225,38 @@ separate dead-letter stream. Retryable failures use a Redis sorted-set delay bef
 returning to the stream. Changing trace names or metadata does not change extraction
 or storage code.
 
-### Closed-session producer
+### Closed conversation-episode producer
 
-`python -m dreamer.producer` performs one scan. Add `--forever` to repeat every
-`MEMORY_SCAN_INTERVAL_SECONDS` (30 minutes by default). A session is closed after
-`MEMORY_SESSION_CLOSE_SECONDS` (40 minutes by default).
+`python -m dreamer.producer` scans through the present every 30 minutes. It groups
+trusted activity by farmer, surface and source session. An episode closes only after
+the complete session has been inactive for `MEMORY_EPISODE_INACTIVITY_SECONDS`
+(40 minutes by default). Later activity under the same session receives the next
+immutable episode number; a late trace inside a closed boundary creates a revision.
 
-The adapter deliberately matches the telemetry contract on the current
-`amul-oan-api/main`: root `chat.translation`, schema `chat.turn.v1`, and metadata
-fields `user_id` and `persona`. It also requires the trace-level `userId` to match
-the metadata identity, requires farmer persona in both metadata and input, and uses
-only traces whose `turn_outcome` score is `success`. This mapping is isolated in
-`CurrentMainTelemetryAdapter` so the planned `turn` / `amul.farmer_id` telemetry
-shape changes one boundary instead of the worker.
+The adapter matches two explicit `amul-oan-api` contracts. Chat uses root
+`chat.translation`, schema `chat.turn.v1`, matching trace/metadata identity,
+farmer persona, and the successful `turn_outcome` score. The adapter also accepts
+chat's new `turn` / `turn.v1` contract during the telemetry migration. Voice support depends on
+amul-oan-api PR #432: root `turn`, schema `turn.v1`, `amul.pipeline=telephony`, service
+`amul-oan-api`, `amul.signed_in=true`, a canonical `amul.farmer_id` matching the
+trace identity, full input/output text, and metadata outcome `success`. Missing or
+malformed voice fields fail closed; greetings, moderation rejections, stale or
+disconnected calls, consent-only replies, errors, anonymous calls, and legacy
+`voice-oan-api` traces never become evidence. The mapping stays isolated in
+`CurrentMainTelemetryAdapter`; the task, queue, and processor contracts are unchanged.
 
-Sessions that exceed the task contract are split into chronological tasks. They
-keep the same farmer/session subject, and worker progress unions processed-turn
-fingerprints across fragments so no successful fragment is forgotten or replayed.
+Every trusted trace extends session activity, while only successful traces with
+complete text become memory evidence. The producer refetches the complete session
+before publishing. Its HMAC-keyed Redis ledger stores boundaries, episode/revision
+numbers and trace fingerprints, but no phone numbers or conversation text. A daily,
+30-day bounded reconciliation refetches known sessions to find delayed old-timestamp
+traces. Queue publication and revision checkpointing are atomic.
 
 Safe rollout is the default:
 
 - `MEMORY_PRODUCER_DRY_RUN=true` prevents queue writes.
+- `MEMORY_EVENT_NOT_BEFORE` sets the UTC rollout boundary and is required before
+  dry-run is disabled. Older traces are never backfilled.
 - `MEMORY_FARMER_ALLOWLIST_ENABLED=true` restricts eligibility to the comma-separated
   canonical phones in `MEMORY_FARMER_ALLOWLIST`; an empty list selects nobody.
 - After the allowlisted test is accepted, set
@@ -256,8 +278,9 @@ schedule, deployment configuration, replay approval, cost measurement, and alert
 rules remain later integration/deployment work.
 
 Delivery is at-least-once. A task can be delivered again after writes succeed but
-before acknowledgement, so the future processor must use the task key and source
-trace IDs for idempotency. Retry and dead-letter reasons contain only fixed error
+before acknowledgement, so the processor uses the episode subject key,
+exact task revision and pending source trace IDs for idempotency. Retry and
+dead-letter reasons contain only fixed error
 codes or exception class names, never exception text or task payloads.
 
 ## Verification
@@ -269,6 +292,7 @@ python3 -m unittest discover -s tests -p 'test_unit.py'
 python3 -m unittest discover -s tests -p 'test_review_regressions.py'
 python3 -m unittest discover -s tests -p 'test_bot_tools.py'
 python3 -m unittest discover -s tests -p 'test_queue_worker.py'
+python3 -m unittest discover -s tests -p 'test_producer.py'
 ```
 
 `tests/test_service.py` writes synthetic records only when `AMUL_MEMORY_INTEGRATION=1`.

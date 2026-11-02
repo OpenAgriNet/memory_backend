@@ -13,6 +13,8 @@ from dotenv import dotenv_values
 
 CHAT_TRACE_NAME = "chat.translation"
 CHAT_SCHEMA_VERSION = "chat.turn.v1"
+TURN_TRACE_NAME = "turn"
+TURN_SCHEMA_VERSION = "turn.v1"
 
 
 class LangfuseRO:
@@ -46,10 +48,10 @@ class LangfuseRO:
             r.raise_for_status()
         raise RuntimeError(f"GET {path} failed after {retries} attempts")
 
-    def traces(self, start, stop, **filters):
+    def traces(self, start, stop, *, name=CHAT_TRACE_NAME, **filters):
         """Read root traces for one UTC window, splitting costly queries safely."""
         params = {
-            "name": CHAT_TRACE_NAME,
+            "name": name,
             "fromTimestamp": iso(start),
             "toTimestamp": iso(stop),
             "limit": 100,
@@ -71,8 +73,8 @@ class LangfuseRO:
             if stop - start <= dt.timedelta(hours=1):
                 raise
             middle = start + (stop - start) / 2
-            return self.traces(start, middle, **filters) + self.traces(
-                middle, stop, **filters
+            return self.traces(start, middle, name=name, **filters) + self.traces(
+                middle, stop, name=name, **filters
             )
 
     def farmer_turns(self, farmer_id, days_back=30, until=None):
