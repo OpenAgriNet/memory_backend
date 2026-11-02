@@ -58,23 +58,23 @@ class RedisStreamTaskQueue:
             ),
             override=False,
         )
-        self.stream = _key("MEMORY_QUEUE_STREAM", "amul:memory:tasks:v1")
+        self.stream = _key("MEMORY_QUEUE_STREAM", "amul:memory:tasks:v2")
         self.dead_letter_stream = _key(
-            "MEMORY_QUEUE_DLQ_STREAM", "amul:memory:tasks:dead:v1"
+            "MEMORY_QUEUE_DLQ_STREAM", "amul:memory:tasks:dead:v2"
         )
-        self.group = _key("MEMORY_QUEUE_CONSUMER_GROUP", "memory-workers-v1")
+        self.group = _key("MEMORY_QUEUE_CONSUMER_GROUP", "memory-workers-v2")
         self.consumer = _key(
             "MEMORY_QUEUE_CONSUMER_NAME",
             f"worker-{os.getpid()}",
         )
         self.dedupe_prefix = _key(
-            "MEMORY_QUEUE_DEDUPE_PREFIX", "amul:memory:task-published:v1"
+            "MEMORY_QUEUE_DEDUPE_PREFIX", "amul:memory:task-published:v2"
         )
         self.watermark_key = _key(
-            "MEMORY_QUEUE_WATERMARK_KEY", "amul:memory:event-watermark:v1"
+            "MEMORY_QUEUE_WATERMARK_KEY", "amul:memory:event-watermark:v2"
         )
         self.retry_set = _key(
-            "MEMORY_QUEUE_RETRY_SET", "amul:memory:tasks:retry:v1"
+            "MEMORY_QUEUE_RETRY_SET", "amul:memory:tasks:retry:v2"
         )
         self.visibility_ms = _positive_env(
             "MEMORY_QUEUE_VISIBILITY_SECONDS", 900, minimum=30
@@ -316,3 +316,18 @@ class RedisStreamTaskQueue:
         pipe.xdel(self.stream, receipt)
         pipe.execute()
         self._delivered.pop(receipt, None)
+
+    def publish_producer_dead_letter(self, reason: str, subject_key: str) -> None:
+        """Record a source task that cannot safely fit the queue contract."""
+        self.client.xadd(
+            self.dead_letter_stream,
+            {
+                "body": "",
+                "attempts": "0",
+                "task_key": subject_key,
+                "reason": reason,
+                "failed_at": _utc_now(),
+            },
+            maxlen=self.max_length,
+            approximate=True,
+        )
