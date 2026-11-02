@@ -39,12 +39,18 @@ class AuthContract(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(head_response.content, b"")
 
     async def test_protected_routes_return_safe_401_and_accept_valid_token(self):
-        for authorization in (None, "Basic abc", "Bearer wrong", "Bearer two words"):
-            headers = {} if authorization is None else {"Authorization": authorization}
-            response = await self.client.get("/keys", headers=headers)
-            self.assertEqual(response.status_code, 401)
-            self.assertEqual(response.json(), {"detail": "Unauthorized"})
-            self.assertEqual(response.headers.get("www-authenticate"), "Bearer")
+        protected = (
+            ("GET", "/keys"),
+            ("GET", "/internal/memory/9876543210/episodes/" + "a" * 64),
+            ("PUT", "/internal/memory/9876543210/episodes/" + "a" * 64),
+        )
+        for method, path in protected:
+            for authorization in (None, "Basic abc", "Bearer wrong", "Bearer two words"):
+                headers = {} if authorization is None else {"Authorization": authorization}
+                response = await self.client.request(method, path, headers=headers)
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.json(), {"detail": "Unauthorized"})
+                self.assertEqual(response.headers.get("www-authenticate"), "Bearer")
 
         unicode_response = await self.client.get(
             "/keys", headers=[(b"authorization", b"Bearer \xff")]

@@ -102,7 +102,7 @@ def _previous_episode_summary(task: MemoryTask) -> dict[str, object] | None:
         from . import dreamer
     else:
         import dreamer
-    response = requests.get(
+    response = memory_client.get(
         f"{dreamer.MEMORY_API}/internal/memory/{task.farmer_id}"
         f"/episodes/{task.subject_key}",
         timeout=30,

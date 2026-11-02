@@ -217,7 +217,7 @@ def write_episode_summary(ctx: Ctx, headline: str, expanded: str) -> dict:
         ctx.writes.append({"action": "would-write-episode", "entry": body})
         return {"written": True, "dry_run": True}
     try:
-        response = requests.put(
+        response = memory_client.put(
             ctx._url(f"/episodes/{ctx.episode['subject_key']}"),
             json=body,
             timeout=90,
