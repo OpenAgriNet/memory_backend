@@ -134,6 +134,39 @@ class TestEpisodeProducer(unittest.TestCase):
             now=now,
         )
 
+    def test_stale_scan_does_not_publish_or_advance_watermark(self):
+        row = chat_event("first", NOW - dt.timedelta(hours=2))
+        outer = self
+
+        class OverlappingSource(Source):
+            def session(self, session_id, start, stop):
+                outer.produce(Source([row]), NOW - dt.timedelta(minutes=1))
+                return super().session(session_id, start, stop)
+
+        result = self.produce(OverlappingSource([row]))
+        self.assertEqual(result.skipped["stale_episode_ledger"], 1)
+        self.assertEqual(len(self.publisher.tasks), 1)
+        self.assertEqual(self.publisher.watermark_value, NOW - dt.timedelta(minutes=1))
+
+    def test_late_revision_refetches_context_before_discovery_cutoff(self):
+        from dataclasses import replace
+
+        first = NOW - dt.timedelta(hours=3)
+        source = Source([chat_event("first", first)])
+        self.produce(source)
+        source.rows = [chat_event("late", first + dt.timedelta(minutes=20))]
+        revised_config = replace(config(), event_not_before=first + dt.timedelta(minutes=10))
+        later = NOW + dt.timedelta(days=1)
+        result = produce_once(source, self.publisher, revised_config, ledger=self.ledger, now=later)
+        self.assertEqual(result.skipped["missing_episode_context"], 1)
+        self.assertEqual(len(self.publisher.tasks), 1)
+        source.rows.append(chat_event("first", first))
+        produce_once(source, self.publisher, revised_config, ledger=self.ledger, now=later)
+        revision = self.publisher.tasks[-1]
+        self.assertEqual(revision.episode_revision, 2)
+        self.assertEqual([turn.trace_id for turn in revision.turns], ["first", "late"])
+        self.assertEqual(revision.pending_trace_ids, ("late",))
+
     def test_turns_within_40_minutes_form_one_ordered_episode(self):
         source = Source([
             chat_event("trace-2", NOW - dt.timedelta(minutes=60)),

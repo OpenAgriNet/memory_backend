@@ -84,6 +84,9 @@ class MemoryEpisodeLedger:
         raw = self.records.get(key)
         return SessionRecord.from_json(raw.to_json()) if raw else None
 
+    def snapshot(self, key: str) -> str | None:
+        return record.to_json() if (record := self.records.get(key)) else None
+
     def due(self, now: datetime, limit: int = 100) -> list[str]:
         return sorted(
             (key for key, due in self.due_at.items() if due <= now),
@@ -120,13 +123,18 @@ class MemoryEpisodeLedger:
         publisher: Any,
         due_at: datetime | None,
         reconcile_at: datetime,
-    ) -> tuple[int, int]:
+        *, expected: str | None, dead_letters: list[tuple[str, str]] | None = None,
+    ) -> tuple[int, int] | None:
+        if self.snapshot(key) != expected:
+            return None
         published = duplicates = 0
         for task in tasks:
             if publisher.publish(task):
                 published += 1
             else:
                 duplicates += 1
+        for reason, subject in dead_letters or ():
+            publisher.publish_producer_dead_letter(reason, subject)
         self.save(key, farmer_hash, record, due_at, reconcile_at)
         return published, duplicates
 
@@ -158,6 +166,9 @@ class RedisEpisodeLedger:
         raw = self.client.get(self.redis_key(key))
         return SessionRecord.from_json(raw) if raw else None
 
+    def snapshot(self, key: str) -> str | None:
+        return self.client.get(self.redis_key(key))
+
     def due(self, now: datetime, limit: int = 100) -> list[str]:
         return list(self.client.zrangebyscore(
             self.due_set, "-inf", _epoch(now), start=0, num=limit
@@ -168,24 +179,6 @@ class RedisEpisodeLedger:
             self.reconcile_set, "-inf", _epoch(now), start=0, num=limit
         ))
 
-    def save(
-        self,
-        key: str,
-        farmer_hash: str,
-        record: SessionRecord,
-        due_at: datetime | None,
-        reconcile_at: datetime,
-    ) -> None:
-        pipe = self.client.pipeline(transaction=True)
-        pipe.set(self.redis_key(key), record.to_json())
-        if due_at is None:
-            pipe.zrem(self.due_set, key)
-        else:
-            pipe.zadd(self.due_set, {key: _epoch(due_at)})
-        pipe.zadd(self.reconcile_set, {key: _epoch(reconcile_at)})
-        pipe.sadd(f"{self.farmer_index_prefix}:{farmer_hash}", self.redis_key(key))
-        pipe.execute()
-
     def commit(
         self,
         key: str,
@@ -195,7 +188,8 @@ class RedisEpisodeLedger:
         publisher: Any,
         due_at: datetime | None,
         reconcile_at: datetime,
-    ) -> tuple[int, int]:
+        *, expected: str | None, dead_letters: list[tuple[str, str]] | None = None,
+    ) -> tuple[int, int] | None:
         payloads = []
         for task in tasks:
             payloads.extend((
@@ -203,6 +197,9 @@ class RedisEpisodeLedger:
                 json.dumps(task.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             ))
         script = """
+        if (redis.call('GET', KEYS[1]) or '') ~= ARGV[2] then
+          return -1
+        end
         local published = 0
         for index = 1, tonumber(ARGV[1]) do
           local offset = 8 + ((index - 1) * 2)
@@ -210,11 +207,17 @@ class RedisEpisodeLedger:
           local body = ARGV[offset + 1]
           local marker = KEYS[6] .. ':' .. task_key
           if redis.call('EXISTS', marker) == 0 then
-            redis.call('XADD', KEYS[5], 'MAXLEN', '~', ARGV[2], '*',
+            redis.call('XADD', KEYS[5], '*',
               'body', body, 'attempts', '0', 'task_key', task_key)
             redis.call('SET', marker, '1', 'EX', ARGV[3])
             published = published + 1
           end
+        end
+        local dead_start = 8 + 2 * tonumber(ARGV[1])
+        for index = dead_start + 2, #ARGV, 2 do
+          redis.call('XADD', KEYS[7], 'MAXLEN', '~', ARGV[dead_start], '*',
+            'body', '', 'attempts', '0', 'task_key', ARGV[index + 1],
+            'reason', ARGV[index], 'failed_at', ARGV[dead_start + 1])
         end
         redis.call('SET', KEYS[1], ARGV[4])
         if tonumber(ARGV[7]) > 0 then
@@ -228,20 +231,26 @@ class RedisEpisodeLedger:
         """
         published = int(self.client.eval(
             script,
-            6,
+            7,
             self.redis_key(key),
             self.due_set,
             self.reconcile_set,
             f"{self.farmer_index_prefix}:{farmer_hash}",
             publisher.stream,
             publisher.dedupe_prefix,
+            publisher.dead_letter_stream,
             len(tasks),
-            publisher.max_length,
+            expected or "",
             publisher.dedupe_seconds,
             record.to_json(),
             key,
             _epoch(reconcile_at),
             _epoch(due_at) if due_at else 0,
             *payloads,
+            publisher.max_length,
+            datetime.now(timezone.utc).isoformat(),
+            *(value for pair in dead_letters or () for value in pair),
         ))
+        if published < 0:
+            return None
         return published, len(tasks) - published

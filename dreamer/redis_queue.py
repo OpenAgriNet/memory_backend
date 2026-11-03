@@ -150,15 +150,15 @@ class RedisStreamTaskQueue:
         if redis.call('EXISTS', marker) == 1 then
           return 0
         end
-        redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[1], '*',
-          'body', ARGV[2], 'attempts', '0', 'task_key', ARGV[3])
-        redis.call('SET', marker, '1', 'EX', ARGV[4])
+        redis.call('XADD', KEYS[2], '*',
+          'body', ARGV[1], 'attempts', '0', 'task_key', ARGV[2])
+        redis.call('SET', marker, '1', 'EX', ARGV[3])
         return 1
         """
         marker = f"{self.dedupe_prefix}:{task.task_key}"
         return bool(self.client.eval(
             script, 2, marker, self.stream,
-            self.max_length, body, task.task_key, self.dedupe_seconds,
+            body, task.task_key, self.dedupe_seconds,
         ))
 
     def advance_watermark(self, value: datetime) -> None:
@@ -180,7 +180,7 @@ class RedisStreamTaskQueue:
         )
         for _, member in ipairs(due) do
           local item = cjson.decode(member)
-          redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*',
+          redis.call('XADD', KEYS[2], '*',
             'body', item.body, 'attempts', tostring(item.attempts),
             'task_key', item.task_key, 'retry_reason', item.retry_reason)
           redis.call('ZREM', KEYS[1], member)
@@ -189,7 +189,7 @@ class RedisStreamTaskQueue:
         """
         self.client.eval(
             script, 2, self.retry_set, self.stream,
-            time.time(), self.max_length,
+            time.time(),
         )
 
     @staticmethod
