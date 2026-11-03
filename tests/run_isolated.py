@@ -27,7 +27,6 @@ try:
     env = dict(
         os.environ,
         AMUL_CHUNK_TEST_QDRANT=endpoint,
-        AMUL_TASK_STATE_TEST_QDRANT=endpoint,
         QDRANT_URL=endpoint,
         QDRANT_API_KEY="",
         MEMORY_INTERNAL_TOKEN="isolated-test-token-32-characters-minimum",

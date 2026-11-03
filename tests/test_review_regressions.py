@@ -322,11 +322,15 @@ class TestEpisodeSummaries(unittest.IsolatedAsyncioTestCase):
             expanded="Both parts were discussed.", source_traces=["trace-2"],
             pending_trace_ids=["trace-2"],
         )
-        with patch.object(api, "_require_memory_enabled", new_callable=AsyncMock), patch.object(
+        with patch.object(api, "_qdrant", new_callable=AsyncMock,
+                          return_value={"result": {"points": []}}), patch.object(
+                api, "_require_memory_enabled", new_callable=AsyncMock), patch.object(
                 api, "_current_episode_summary", new_callable=AsyncMock,
                 return_value={"id": "old", "payload": old}), patch.object(
                 api, "_store_entry", new_callable=AsyncMock,
-                return_value={"id": "new"}) as store, patch.object(
+                side_effect=lambda *args, **kw: {"id": kw["point_id"], "payload": {
+                    **kw["system_fields"], "farmer_id": args[0], "previous_version": "old",
+                }}) as store, patch.object(
                 api, "_retire", new_callable=AsyncMock) as retire:
             result = await api.put_episode_summary("9876543210", self.subject(), request)
         self.assertTrue(result["applied"])
@@ -334,7 +338,31 @@ class TestEpisodeSummaries(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored_entry.source_traces, ["trace-1", "trace-2"])
         self.assertEqual(store.await_args.kwargs["record_kind"], "episode")
         self.assertEqual(store.await_args.kwargs["system_fields"]["episode_part_number"], 2)
-        retire.assert_awaited_once()
+        self.assertTrue(store.await_args.kwargs["system_fields"]["superseded_at"])
+        self.assertEqual(retire.await_args_list[0].args[0], "old")
+        self.assertIsNone(retire.await_args_list[1].args[2]["superseded_at"])
+
+    async def test_staged_retry_resumes_without_storing_again(self):
+        request = self.request(part_number=2)
+        point_id = str(api.uuid.uuid5(api.uuid.NAMESPACE_URL, f"amul-episode:{self.subject()}:1:2"))
+        staged = {"id": point_id, "payload": {
+            "farmer_id": "9876543210", "previous_version": "old", "previous_chunk_count": 1,
+            "superseded_at": "2026-10-17T09:00:00Z",
+            "episode_request_hash": hashlib.sha256(request.model_dump_json().encode()).hexdigest(),
+        }}
+        with patch.object(api, "_qdrant", new_callable=AsyncMock,
+                          return_value={"result": {"points": [staged]}}), patch.object(
+                api, "_require_memory_enabled", new_callable=AsyncMock), patch.object(
+                api, "_store_entry", new_callable=AsyncMock) as store, patch.object(
+                api, "_retire", new_callable=AsyncMock,
+                side_effect=[None, RuntimeError("publication interrupted"), None, None]) as retire:
+            with self.assertRaises(RuntimeError):
+                await api.put_episode_summary("9876543210", self.subject(), request)
+            result = await api.put_episode_summary("9876543210", self.subject(), request)
+        self.assertEqual(result["id"], point_id)
+        self.assertEqual([call.args[0] for call in retire.await_args_list],
+                         ["old", point_id, "old", point_id])
+        store.assert_not_awaited()
 
     async def test_retry_is_unchanged_and_identity_mismatch_is_rejected(self):
         request = self.request()
@@ -343,7 +371,9 @@ class TestEpisodeSummaries(unittest.IsolatedAsyncioTestCase):
             episode_revision=1, episode_part_number=1, episode_part_count=2,
             source_traces=["trace-1"],
         )
-        with patch.object(api, "_require_memory_enabled", new_callable=AsyncMock), patch.object(
+        with patch.object(api, "_qdrant", new_callable=AsyncMock,
+                          return_value={"result": {"points": []}}), patch.object(
+                api, "_require_memory_enabled", new_callable=AsyncMock), patch.object(
                 api, "_current_episode_summary", new_callable=AsyncMock,
                 return_value={"id": "old", "payload": old}), patch.object(
                 api, "_store_entry", new_callable=AsyncMock) as store:
