@@ -18,15 +18,19 @@ import urllib.request
 import uuid
 
 API = os.environ.get("MEMORY_API_URL", "http://localhost:8100").rstrip("/")
+TOKEN = os.environ.get("MEMORY_INTERNAL_TOKEN", "")
 QDRANT = os.environ.get("QDRANT_HTTP", "http://localhost:6350").rstrip("/")
 COLLECTION = os.environ.get("QDRANT_COLLECTION", "amul_memory")
 PREFIX = "zz-test-"
 
 
 def _req(method, url, body=None):
+    headers = {"Content-Type": "application/json"}
+    if not (method in {"GET", "HEAD"} and url.rstrip("/").endswith("/health")):
+        headers["Authorization"] = f"Bearer {TOKEN}"
     r = urllib.request.Request(
         url, data=json.dumps(body).encode() if body is not None else None,
-        headers={"Content-Type": "application/json"}, method=method)
+        headers=headers, method=method)
     return json.load(urllib.request.urlopen(r, timeout=90))
 
 

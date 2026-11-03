@@ -51,16 +51,15 @@ import os
 import re
 import sys
 
-import requests
-
 if __package__:
-    from . import agent, dates, lf, llm, prompts, tools, writer
+    from . import agent, dates, lf, llm, memory_client, prompts, tools, writer
     from service.runtime_config import required
 else:
     import agent
     import dates
     import lf
     import llm
+    import memory_client
     import prompts
     import tools
     import writer
@@ -133,7 +132,7 @@ def batches(queues):
 
 def _known_keys(strict=False):
     try:
-        r = requests.get(f"{MEMORY_API}/keys", timeout=30)
+        r = memory_client.get(f"{MEMORY_API}/keys", timeout=30)
         r.raise_for_status()
         return [{"key": k["key"], "description": k.get("description")} for k in r.json()["keys"]]
     except Exception as exc:  # noqa: BLE001 - first run has no keys yet
@@ -171,7 +170,7 @@ def _candidates(farmer_id, entry):
     for q in queries:
         for path in ("search", "search_expanded"):
             try:
-                r = requests.post(
+                r = memory_client.post(
                     f"{MEMORY_API}/internal/memory/{farmer_id}/{path}",
                     json={"query": q, "limit": CANDIDATE_POOL, "only_current": True},
                     timeout=60,
@@ -347,7 +346,7 @@ def process_chunk(farmer_id, turns, known_keys, dry_run=False, headline_pass=Tru
         if dry_run:
             continue
         try:
-            requests.post(f"{MEMORY_API}/keys/doc", json={
+            memory_client.post(f"{MEMORY_API}/keys/doc", json={
                 "key": nk["key"], "description": nk["description"]}, timeout=30).raise_for_status()
         except Exception as exc:  # noqa: BLE001
             print(f"  ! could not document key {nk.get('key')!r}: {exc}", file=sys.stderr)
@@ -455,7 +454,7 @@ def _current_entries(farmer_id):
         params = {"limit": 100, "only_current": "true"}
         if cursor:
             params["cursor"] = cursor
-        response = requests.get(f"{MEMORY_API}/internal/memory/{farmer_id}/entries",
+        response = memory_client.get(f"{MEMORY_API}/internal/memory/{farmer_id}/entries",
                                 params=params, timeout=60)
         response.raise_for_status()
         body = response.json()
@@ -617,7 +616,7 @@ def update_profile(farmer_id, dry_run=False, recent_asks=()):
     phrasing, and the Layer-2 headlines have paraphrased it away.
     """
     try:
-        cur = requests.get(f"{MEMORY_API}/internal/memory/{farmer_id}/profile", timeout=30)
+        cur = memory_client.get(f"{MEMORY_API}/internal/memory/{farmer_id}/profile", timeout=30)
         cur.raise_for_status()
         current = cur.json().get("profile") or {}
         headlines = sorted(_current_entries(farmer_id),

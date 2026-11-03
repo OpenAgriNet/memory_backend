@@ -28,14 +28,13 @@ from __future__ import annotations
 
 import re
 
-import requests
-
 if __package__:
-    from . import judges, llm, prompts
+    from . import judges, llm, memory_client, prompts
     from service import episode
 else:
     import judges
     import llm
+    import memory_client
     import prompts
     import episode
 
@@ -203,7 +202,7 @@ def _write(ctx, change):
         return {"ok": True, "dry_run": True, "entry_id": "dry-run", "notes": notes}
 
     try:
-        r = requests.post(f"{ctx.api}/memory/{ctx.farmer_id}/entries", json=body, timeout=90)
+        r = memory_client.post(f"{ctx.api}/memory/{ctx.farmer_id}/entries", json=body, timeout=90)
         r.raise_for_status()
         res = r.json()
     except Exception as exc:  # noqa: BLE001
@@ -283,7 +282,7 @@ def _update(ctx, change):
         return {"ok": True, "dry_run": True, "notes": notes}
 
     try:
-        r = requests.patch(f"{ctx.api}/memory/{ctx.farmer_id}/entries/{entry_id}",
+        r = memory_client.patch(f"{ctx.api}/memory/{ctx.farmer_id}/entries/{entry_id}",
                            json=body, timeout=120)
         r.raise_for_status()
         res = r.json()
@@ -308,7 +307,7 @@ def _fold(ctx, change):
                            "notes": [change.get("reason", "")]})
         return {"ok": True, "dry_run": True}
     try:
-        r = requests.post(
+        r = memory_client.post(
             f"{ctx.api}/memory/{ctx.farmer_id}/entries/{change['entry_id']}/fold",
             json={"merged_into": change["merged_into"], "reason": change.get("reason", "")},
             timeout=60)
@@ -323,7 +322,7 @@ def _fold(ctx, change):
 
 def _fetch(ctx, entry_id):
     try:
-        r = requests.get(f"{ctx.api}/internal/memory/{ctx.farmer_id}/entries/{entry_id}", timeout=60)
+        r = memory_client.get(f"{ctx.api}/internal/memory/{ctx.farmer_id}/entries/{entry_id}", timeout=60)
         r.raise_for_status()
         body = r.json()
         return body.get("entry") if body.get("current") else None
@@ -355,7 +354,7 @@ def _profile(ctx, change):
     if ctx.dry_run:
         return {"ok": True, "dry_run": True, "fields": cleaned}
     try:
-        response = requests.put(f"{ctx.api}/memory/{ctx.farmer_id}/profile", json=body, timeout=90)
+        response = memory_client.put(f"{ctx.api}/memory/{ctx.farmer_id}/profile", json=body, timeout=90)
         response.raise_for_status()
         result = response.json()
     except Exception as exc:
