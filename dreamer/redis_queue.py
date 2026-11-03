@@ -5,7 +5,6 @@ stream.  Task validation and processing remain broker-neutral.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -18,9 +17,11 @@ from typing import Any
 from dotenv import load_dotenv
 
 if __package__:
+    from .identity import farmer_key
     from .queue_worker import QueueMessage
     from .tasks import MemoryTask
 else:
+    from identity import farmer_key
     from queue_worker import QueueMessage
     from tasks import MemoryTask
 
@@ -59,23 +60,23 @@ class RedisStreamTaskQueue:
             ),
             override=False,
         )
-        self.stream = _key("MEMORY_QUEUE_STREAM", "amul:memory:tasks:v1")
+        self.stream = _key("MEMORY_QUEUE_STREAM", "amul:memory:tasks:v2")
         self.dead_letter_stream = _key(
-            "MEMORY_QUEUE_DLQ_STREAM", "amul:memory:tasks:dead:v1"
+            "MEMORY_QUEUE_DLQ_STREAM", "amul:memory:tasks:dead:v2"
         )
-        self.group = _key("MEMORY_QUEUE_CONSUMER_GROUP", "memory-workers-v1")
+        self.group = _key("MEMORY_QUEUE_CONSUMER_GROUP", "memory-workers-v2")
         self.consumer = _key(
             "MEMORY_QUEUE_CONSUMER_NAME",
             f"worker-{os.getpid()}",
         )
         self.dedupe_prefix = _key(
-            "MEMORY_QUEUE_DEDUPE_PREFIX", "amul:memory:task-published:v1"
+            "MEMORY_QUEUE_DEDUPE_PREFIX", "amul:memory:task-published:v2"
         )
-        self.revision_prefix = _key(
-            "MEMORY_QUEUE_REVISION_PREFIX", "amul:memory:session-revision:v1"
+        self.watermark_key = _key(
+            "MEMORY_QUEUE_WATERMARK_KEY", "amul:memory:event-watermark:v2"
         )
         self.retry_set = _key(
-            "MEMORY_QUEUE_RETRY_SET", "amul:memory:tasks:retry:v1"
+            "MEMORY_QUEUE_RETRY_SET", "amul:memory:tasks:retry:v2"
         )
         self.visibility_ms = _positive_env(
             "MEMORY_QUEUE_VISIBILITY_SECONDS", 900, minimum=30
@@ -128,13 +129,14 @@ class RedisStreamTaskQueue:
                 raise
         self._ready = True
 
-    @staticmethod
-    def revision_key(trace_id: str) -> str:
-        return hashlib.sha256(trace_id.encode("utf-8")).hexdigest()
-
-    def revision_published(self, subject_key: str, revision_key: str) -> bool:
-        value = self.client.get(f"{self.revision_prefix}:{subject_key}")
-        return value == revision_key
+    def watermark(self) -> datetime | None:
+        value = self.client.get(self.watermark_key)
+        if value is None:
+            return None
+        try:
+            return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
+        except (TypeError, ValueError, OSError) as exc:
+            raise RuntimeError("invalid producer watermark") from exc
 
     def publish(self, task: MemoryTask) -> bool:
         """Publish one task once per task key.
@@ -155,18 +157,23 @@ class RedisStreamTaskQueue:
         redis.call('SET', marker, '1', 'EX', ARGV[4])
         return 1
         """
-        marker = f"{self.dedupe_prefix}:{task.task_key}"
+        marker = f"{self.dedupe_prefix}:{farmer_key(task.farmer_id)}:{task.task_key}"
         return bool(self.client.eval(
             script, 2, marker, self.stream,
             self.max_length, body, task.task_key, self.dedupe_seconds,
         ))
 
-    def mark_revision_published(self, subject_key: str, revision_key: str) -> None:
-        self.client.set(
-            f"{self.revision_prefix}:{subject_key}",
-            revision_key,
-            ex=self.dedupe_seconds,
-        )
+    def advance_watermark(self, value: datetime) -> None:
+        milliseconds = int(value.astimezone(timezone.utc).timestamp() * 1000)
+        script = """
+        local current = redis.call('GET', KEYS[1])
+        if current and tonumber(current) >= tonumber(ARGV[1]) then
+          return 0
+        end
+        redis.call('SET', KEYS[1], ARGV[1])
+        return 1
+        """
+        self.client.eval(script, 1, self.watermark_key, milliseconds)
 
     def _promote_due_retries(self) -> None:
         script = """
@@ -311,3 +318,19 @@ class RedisStreamTaskQueue:
         pipe.xdel(self.stream, receipt)
         pipe.execute()
         self._delivered.pop(receipt, None)
+
+    def publish_producer_dead_letter(self, reason: str, subject_key: str, farmer_hash: str) -> None:
+        """Record a source task that cannot safely fit the queue contract."""
+        self.client.xadd(
+            self.dead_letter_stream,
+            {
+                "body": "",
+                "attempts": "0",
+                "task_key": subject_key,
+                "farmer_key": farmer_hash,
+                "reason": reason,
+                "failed_at": _utc_now(),
+            },
+            maxlen=self.max_length,
+            approximate=True,
+        )
