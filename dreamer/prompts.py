@@ -4,9 +4,12 @@ from pathlib import Path
 
 # The service image and background job use the same program-owned schema file.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
-import profile_schema
-
-import dates
+if __package__:
+    from service import profile_schema
+    from . import dates
+else:
+    import profile_schema
+    import dates
 """The instruction sheets that decide what gets remembered.
 
 These are the heart of the dreamer — no tool decides what matters, this does.
@@ -546,7 +549,10 @@ ALREADY HELD ABOUT THIS FARMER:
 # --------------------------------------------------------------------------
 # Level 2 describes the bounded, lossless Level 3 chunks; it never rewrites them.
 # --------------------------------------------------------------------------
-import episode
+if __package__:
+    from service import episode
+else:
+    import episode
 
 CONTENTS_SYSTEM = """Create a compact Level 2 summary and contents page for one remembered episode.
 Keep the supplied detail intact: you are describing it, not replacing it.

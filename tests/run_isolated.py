@@ -24,7 +24,8 @@ try:
             time.sleep(0.2)
     else:
         raise RuntimeError("test Qdrant did not become ready")
-    env = dict(os.environ, AMUL_CHUNK_TEST_QDRANT=endpoint, QDRANT_URL=endpoint, QDRANT_API_KEY="")
+    env = dict(os.environ, AMUL_CHUNK_TEST_QDRANT=endpoint,
+               QDRANT_URL=endpoint, QDRANT_API_KEY="")
     result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_episode_chunks.py", "-v"],
                             cwd=Path(__file__).resolve().parents[1], env=env)
     if result.returncode == 0:

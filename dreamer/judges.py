@@ -18,8 +18,11 @@ irreversible step. Everything before it is a proposal.
 """
 from concurrent.futures import ThreadPoolExecutor
 
-import dates
-import llm
+if __package__:
+    from . import dates, llm
+else:
+    import dates
+    import llm
 
 # --------------------------------------------------------------------------
 

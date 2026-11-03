@@ -30,10 +30,14 @@ import re
 
 import requests
 
-import judges
-import llm
-import prompts
-import episode
+if __package__:
+    from . import judges, llm, prompts
+    from service import episode
+else:
+    import judges
+    import llm
+    import prompts
+    import episode
 
 _ID_RUN = re.compile(r"\b\d{8,}\b")
 
