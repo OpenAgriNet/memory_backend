@@ -86,6 +86,7 @@ class ConfigurationAndClientContract(unittest.TestCase):
     def test_client_scopes_and_owns_authorization_header(self):
         target = os.environ["MEMORY_API_URL"].rstrip("/") + "/keys"
         with patch.object(memory_client.requests, "request") as request:
+            request.return_value.status_code = 200
             memory_client.get(target, headers={"X-Test": "yes"}, timeout=5)
         headers = request.call_args.kwargs["headers"]
         self.assertEqual(headers["Authorization"], f"Bearer {api.MEMORY_INTERNAL_TOKEN}")
