@@ -217,6 +217,13 @@ class TestLeases(unittest.TestCase):
     def store(self):
         return MemoryQdrant(self.backing, self.clock)
 
+    def test_opt_out_skips_the_remaining_episode_after_opt_in(self):
+        store = self.store()
+        self.assertEqual(process_task(task(), store, settings_check=lambda _: False).outcome, "no_op")
+        self.assertEqual(process_task(task(revision=2), store, settings_check=lambda _: True).outcome,
+                         "already_completed")
+        self.assertEqual(store.begin(task(episode_number=2)).outcome, "started")
+
     def test_active_lease_defers_and_only_one_claim_wins(self):
         first, second = self.store(), self.store()
         self.assertEqual(first.begin(task()).outcome, "started")

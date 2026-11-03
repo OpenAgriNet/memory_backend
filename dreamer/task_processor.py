@@ -16,7 +16,7 @@ else:
     from tasks import MemoryTask, SourceTurn
 
 StateOutcome = Literal["started", "completed", "deferred", "needs_review"]
-CompletionOutcome = Literal["completed", "no_op"]
+CompletionOutcome = Literal["completed", "no_op", "skipped"]
 FailureDisposition = Literal["retryable", "needs_review"]
 BeforeMutation = Callable[[], None]
 Runner = Callable[[MemoryTask, Sequence[list[dict[str, object]]], BeforeMutation], int]
@@ -248,7 +248,7 @@ def process_task(
         raise RetryableTaskError("memory_setting_unavailable") from exc
     if not enabled:
         try:
-            state_store.complete(task, "no_op", all_processed)
+            state_store.complete(task, "skipped", ())
         except Exception as exc:
             _record_failure(state_store, task, "retryable")
             raise RetryableTaskError("task_completion_uncertain") from exc
