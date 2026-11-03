@@ -161,7 +161,10 @@ class QdrantEraseStore:
                 break
         return tuple(sorted(task_keys))
 
-    def inventory(self, farmer_id: str, identity_key: str, subjects: tuple[str, ...]) -> QdrantInventory:
+    def inventory(
+        self, farmer_id: str, identity_key: str, subjects: tuple[str, ...],
+        *, include_task_keys: bool = True,
+    ) -> QdrantInventory:
         state_exists = self._collection_exists(self.state_collection)
         state_filter = self._state_filter(identity_key, subjects)
         return QdrantInventory(
@@ -172,7 +175,7 @@ class QdrantEraseStore:
                 self._count(self.state_collection, state_filter)
                 if state_exists else 0
             ),
-            task_keys=self._state_markers(state_filter) if state_exists else (),
+            task_keys=self._state_markers(state_filter) if state_exists and include_task_keys else (),
         )
 
     def _erase_record(self, farmer_id: str) -> dict:
@@ -326,7 +329,10 @@ class RedisEraseStore:
                 matched_task_keys.add(task_key)
 
         markers = set(self.client.scan_iter(match=f"{self.dedupe_prefix}:{identity}:*"))
-        markers.update(f"{self.dedupe_prefix}:{value}" for value in matched_task_keys)
+        for value in matched_task_keys:
+            key = f"{self.dedupe_prefix}:{value}"
+            if self.client.exists(key):
+                markers.add(key)
         return RedisInventory(
             stream_entries=len(stream_ids),
             dead_letters=len(dead_letter_ids),
@@ -436,15 +442,19 @@ def erase_farmer(
             or redis.markers_exist(redis_plan.marker_keys)
         ):
             raise RuntimeError("Redis cleanup incomplete")
+    except Exception as exc:
+        raise EraseFailure("verify_redis_cleanup", exc) from exc
+
+    try:
         qdrant.delete_state(identity_key, subjects)
-        if qdrant.inventory(identity, identity_key, subjects).state_points:
+        if qdrant.inventory(identity, identity_key, subjects, include_task_keys=False).state_points:
             raise RuntimeError("task state cleanup incomplete")
     except Exception as exc:
         raise EraseFailure("delete_task_state", exc) from exc
 
     try:
         redis.finish(redis_plan)
-        remaining_qdrant = qdrant.inventory(identity, identity_key, subjects)
+        remaining_qdrant = qdrant.inventory(identity, identity_key, subjects, include_task_keys=False)
         remaining_redis = redis.inventory(identity)
         verified = (
             qdrant.settings_disabled(identity)

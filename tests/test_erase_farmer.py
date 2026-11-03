@@ -52,9 +52,9 @@ class FakeQdrant:
         self.task_keys = (task.task_key,)
         self.fail_stage = None
 
-    def inventory(self, _phone, _farmer_key, _subjects):
+    def inventory(self, _phone, _farmer_key, _subjects, *, include_task_keys=True):
         return erase.QdrantInventory(
-            self.memory_points, self.state_points, self.task_keys
+            self.memory_points, self.state_points, self.task_keys if include_task_keys else ()
         )
 
     def disable(self, _phone):
