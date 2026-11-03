@@ -18,10 +18,8 @@ from dotenv import load_dotenv
 
 if __package__:
     from .queue_worker import QueueMessage
-    from .tasks import MemoryTask
 else:
     from queue_worker import QueueMessage
-    from tasks import MemoryTask
 
 
 _SAFE_KEY = re.compile(r"^[A-Za-z0-9:._-]+$")
@@ -135,31 +133,6 @@ class RedisStreamTaskQueue:
             return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
         except (TypeError, ValueError, OSError) as exc:
             raise RuntimeError("invalid producer watermark") from exc
-
-    def publish(self, task: MemoryTask) -> bool:
-        """Publish one task once per task key.
-
-        The Lua operation keeps the dedupe marker and XADD atomic.  False means
-        this exact task revision was already published.
-        """
-        body = json.dumps(
-            task.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-        script = """
-        local marker = KEYS[1]
-        if redis.call('EXISTS', marker) == 1 then
-          return 0
-        end
-        redis.call('XADD', KEYS[2], '*',
-          'body', ARGV[1], 'attempts', '0', 'task_key', ARGV[2])
-        redis.call('SET', marker, '1', 'EX', ARGV[3])
-        return 1
-        """
-        marker = f"{self.dedupe_prefix}:{task.task_key}"
-        return bool(self.client.eval(
-            script, 2, marker, self.stream,
-            body, task.task_key, self.dedupe_seconds,
-        ))
 
     def advance_watermark(self, value: datetime) -> None:
         milliseconds = int(value.astimezone(timezone.utc).timestamp() * 1000)

@@ -33,7 +33,6 @@ class EpisodeRecord:
     number: int
     started_at: str
     ended_at: str
-    last_activity_at: str
     revision: int = 0
     traces: dict[str, TraceRecord] = field(default_factory=dict)
 
@@ -45,8 +44,12 @@ class SessionRecord:
     episodes: list[EpisodeRecord] = field(default_factory=list)
 
     def to_json(self) -> str:
+        value = asdict(self)
+        # Keep the v2 wire field for readers on older branches.
+        for episode in value["episodes"]:
+            episode["last_activity_at"] = episode["ended_at"]
         return json.dumps(
-            {"schema_version": 2, **asdict(self)},
+            {"schema_version": 2, **value},
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -65,7 +68,6 @@ class SessionRecord:
                 number=item["number"],
                 started_at=item["started_at"],
                 ended_at=item["ended_at"],
-                last_activity_at=item["last_activity_at"],
                 revision=item.get("revision", 0),
                 traces=traces,
             ))

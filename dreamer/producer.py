@@ -6,7 +6,7 @@ import json
 import os
 import re
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -302,13 +302,13 @@ def _assign(record: SessionRecord, trace: ObservedTrace, inactivity: int) -> Epi
     else:
         episode = EpisodeRecord(
             max((item.number for item in record.episodes), default=0) + 1,
-            _iso(trace.observed_at), _iso(trace.observed_at), _iso(trace.observed_at),
+            _iso(trace.observed_at), _iso(trace.observed_at),
         )
         record.episodes.append(episode)
     start = min(_timestamp(episode.started_at), trace.observed_at)
     end = max(_timestamp(episode.ended_at), trace.observed_at)
     assert start is not None and end is not None
-    episode.started_at, episode.ended_at, episode.last_activity_at = _iso(start), _iso(end), _iso(end)
+    episode.started_at, episode.ended_at = _iso(start), _iso(end)
     return episode
 
 
@@ -404,13 +404,13 @@ def produce_once(
     scan_start = max(cutoff, watermark - timedelta(seconds=config.scan_seconds) if watermark else cutoff)
     recent = source.recent(scan_start, now)
     skipped: Counter[str] = Counter()
-    discovered: dict[tuple[str, str, str], list[ObservedTrace]] = defaultdict(list)
+    discovered: set[tuple[str, str, str]] = set()
     for row in recent:
         trace, reason = adapter.trace(row) if isinstance(row, Mapping) else (None, "invalid_trace")
         if trace is None:
             skipped[reason] += 1
         elif cutoff <= trace.observed_at <= now:
-            discovered[(trace.farmer_id, trace.surface, trace.session_id)].append(trace)
+            discovered.add((trace.farmer_id, trace.surface, trace.session_id))
         else:
             skipped["outside_event_window"] += 1
 
@@ -482,7 +482,7 @@ def produce_once(
         tasks: list[MemoryTask] = []
         touched: list[tuple[EpisodeRecord, list[ObservedTrace]]] = []
         for episode in sorted(record.episodes, key=lambda item: item.number):
-            last_activity = _timestamp(episode.last_activity_at)
+            last_activity = _timestamp(episode.ended_at)
             assert last_activity is not None
             closes_at = last_activity + timedelta(seconds=config.inactivity_seconds)
             if closes_at > now:
@@ -530,7 +530,7 @@ def produce_once(
                 for trace in pending_rows:
                     episode.traces[trace_key(trace.trace_id)].published_fingerprint = trace.fingerprint
         else:
-            latest = max((_timestamp(item.last_activity_at) for item in record.episodes), default=now)
+            latest = max((_timestamp(item.ended_at) for item in record.episodes), default=now)
             if latest < now - timedelta(seconds=config.reconcile_horizon_seconds):
                 reconcile_at = datetime.max.replace(tzinfo=timezone.utc)
         result = ledger.commit(

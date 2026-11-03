@@ -221,61 +221,20 @@ or storage code.
 
 ### Closed conversation-episode producer
 
-`python -m dreamer.producer` scans through the present every 30 minutes. It groups
-trusted activity by farmer, surface and source session. An episode closes only after
-the complete session has been inactive for `MEMORY_EPISODE_INACTIVITY_SECONDS`
-(40 minutes by default). Later activity under the same session receives the next
-immutable episode number; a late trace inside a closed boundary creates a revision.
+Run `python -m dreamer.producer` for one scan or add `--forever` to scan every
+30 minutes by default. Dry run is on by default and leaves Redis unchanged.
+Episodes close after 40 minutes without trusted activity by default. Late turns
+can revise a closed episode, and a daily recheck looks for delayed traces.
 
-The adapter matches two explicit `amul-oan-api` contracts. Chat uses root
-`chat.translation`, schema `chat.turn.v1`, matching trace/metadata identity,
-farmer persona, and the successful `turn_outcome` score. The adapter also accepts
-chat's new `turn` / `turn.v1` contract during the telemetry migration. Voice support depends on
-amul-oan-api PR #432: root `turn`, schema `turn.v1`, `amul.pipeline=telephony`, service
-`amul-oan-api`, `amul.signed_in=true`, a canonical `amul.farmer_id` matching the
-trace identity, full input/output text, and metadata outcome `success`. Missing or
-malformed voice fields fail closed; greetings, moderation rejections, stale or
-disconnected calls, consent-only replies, errors, anonymous calls, and legacy
-`voice-oan-api` traces never become evidence. The mapping stays isolated in
-`CurrentMainTelemetryAdapter`; the task, queue, and processor contracts are unchanged.
+For live queueing, install `requirements-worker.txt`, set `MEMORY_REDIS_URL` and
+the UTC `MEMORY_EVENT_NOT_BEFORE` boundary, configure the farmer allowlist, and
+disable dry run. An enabled empty allowlist selects nobody. Run
+`python -m dreamer.redis_worker` to consume tasks. Check the scan counters and
+the Redis dead-letter stream for failures.
 
-Every trusted trace extends session activity, while only successful traces with
-complete text become memory evidence. The producer refetches the complete session
-before publishing. Its HMAC-keyed Redis ledger stores boundaries, episode/revision
-numbers and trace fingerprints, but no phone numbers or conversation text. A daily,
-30-day bounded reconciliation refetches known sessions to find delayed old-timestamp
-traces. Queue publication and revision checkpointing are atomic.
-
-Safe rollout is the default:
-
-- `MEMORY_PRODUCER_DRY_RUN=true` prevents queue writes.
-- `MEMORY_EVENT_NOT_BEFORE` sets the UTC rollout boundary and is required before
-  dry-run is disabled. Older traces are never backfilled.
-- `MEMORY_FARMER_ALLOWLIST_ENABLED=true` restricts eligibility to the comma-separated
-  canonical phones in `MEMORY_FARMER_ALLOWLIST`; an empty list selects nobody.
-- After the allowlisted test is accepted, set
-  `MEMORY_FARMER_ALLOWLIST_ENABLED=false` to remove the temporary restriction and
-  scan every eligible farmer. Keep the setting available as a rollback control.
-
-When dry-run is turned off, install `requirements-worker.txt`, set
-`MEMORY_REDIS_URL`, and run `python -m dreamer.redis_worker`. The worker processes
-one task at a time. Redis delivery is at-least-once; expired pending entries are
-reclaimed after the configured visibility interval.
-
-Current main prefers the authenticated JWT phone when setting telemetry `user_id`,
-but still contains a request-value fallback. The adapter cannot prove which branch
-produced an old trace. The matching and phone checks reduce accidental mixing, but
-this limitation must be reviewed before a broad real-data rollout.
-
-Per-phone erasure, restricted read-only bot Qdrant credentials, worker image,
-schedule, deployment configuration, replay approval, cost measurement, and alert
-rules remain later integration/deployment work.
-
-Delivery is at-least-once. A task can be delivered again after writes succeed but
-before acknowledgement, so the processor uses the episode subject key,
-exact task revision and pending source trace IDs for idempotency. Retry and
-dead-letter reasons contain only fixed error
-codes or exception class names, never exception text or task payloads.
+Older chat telemetry may derive identity from a request value. The producer
+cannot verify which path emitted an old trace. See issue #362 for the telemetry
+contract and rollout requirements.
 
 ## Verification
 
@@ -286,7 +245,6 @@ python3 -m unittest discover -s tests -p 'test_unit.py'
 python3 -m unittest discover -s tests -p 'test_review_regressions.py'
 python3 -m unittest discover -s tests -p 'test_bot_tools.py'
 python3 -m unittest discover -s tests -p 'test_queue_worker.py'
-python3 -m unittest discover -s tests -p 'test_producer.py'
 ```
 
 `tests/test_service.py` writes synthetic records only when `AMUL_MEMORY_INTEGRATION=1`.
