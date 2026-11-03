@@ -98,9 +98,9 @@ turn in the bounded episode part for context, while deterministic tool checks al
 ordinary memory mutations only when their evidence includes a newly pending trace.
 Every processed part/revision rewrites one system-owned episode summary; prior
 summaries are supplied when a later part or revision must preserve earlier context.
-`python -m dreamer.worker <task.json>`
-is the supported one-task composition for local/integration use; a later producer PR
-supplies the real broker adapter and telemetry event discovery.
+`python -m dreamer.worker <task.json>` is the supported one-task composition for
+local/integration use. The conversation-episode producer and Redis Streams worker are
+described below.
 
 The background agent proposes changes through `writer.apply`. Failed or malformed
 checks retry once, then block saving and report the proposal for retry. The standing
@@ -192,6 +192,23 @@ exact message for safe redelivery.
 A message is limited to 100 turns, 128,000 conversation characters, and 256 KiB.
 The worker acknowledges success, retries temporary failures, and dead-letters
 invalid messages and permanent failures.
+
+### Closed conversation-episode producer
+
+Run `python -m dreamer.producer` for one scan or add `--forever` to scan every
+30 minutes by default. Dry run is on by default and leaves Redis unchanged.
+Episodes close after 40 minutes without trusted activity by default. Late turns
+can revise a closed episode, and a daily recheck looks for delayed traces.
+
+For live queueing, install `requirements-worker.txt`, set `MEMORY_REDIS_URL` and
+the UTC `MEMORY_EVENT_NOT_BEFORE` boundary, configure the farmer allowlist, and
+disable dry run. An enabled empty allowlist selects nobody. Run
+`python -m dreamer.redis_worker` to consume tasks. Check the scan counters and
+the Redis dead-letter stream for failures.
+
+Older chat telemetry may derive identity from a request value. The producer
+cannot verify which path emitted an old trace. See issue #362 for the telemetry
+contract and rollout requirements.
 
 ## Verification
 
