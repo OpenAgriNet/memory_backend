@@ -9,13 +9,24 @@ except ImportError:  # Direct script execution adds service/ to sys.path.
     from runtime_config import memory_api_headers
 
 
+def _keep_bearer(request):
+    """Explicit auth keeps Requests from applying machine-local credentials."""
+    return request
+
+
 def request(method: str, url: str, **kwargs):
     """Send a request without allowing callers to omit or replace authentication."""
     headers = dict(kwargs.pop("headers", {}) or {})
-    if any(name.lower() == "authorization" for name in headers):
+    if "auth" in kwargs or any(name.lower() == "authorization" for name in headers):
         raise ValueError("Authorization is managed by the Memory API client")
     headers.update(memory_api_headers(url))
-    return requests.request(method, url, headers=headers, **kwargs)
+    kwargs.pop("allow_redirects", None)
+    response = requests.request(
+        method, url, headers=headers, auth=_keep_bearer, allow_redirects=False, **kwargs
+    )
+    if 300 <= response.status_code < 400:
+        raise requests.HTTPError("Unexpected redirect from Memory API", response=response)
+    return response
 
 
 def get(url: str, **kwargs):
