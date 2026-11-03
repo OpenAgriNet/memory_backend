@@ -226,14 +226,21 @@ class TestConsumer(unittest.TestCase):
         self.assertEqual(queue.actions, [("ack", "receipt-1")])
 
     def test_invalid_task_is_dead_lettered_without_processing(self):
-        body = task_body()
-        body["farmer_id"] = ""
-        queue = FakeQueue(body)
-        result = consume_one(queue, lambda task: self.fail("must not process"))
-        self.assertEqual(result.outcome, "dead_lettered")
-        self.assertEqual(queue.actions, [
-            ("dead_letter", "receipt-1", "invalid_task:invalid_farmer_id")
-        ])
+        for field, value, reason in (
+            ("farmer_id", "", "invalid_farmer_id"),
+            ("surface", [], "invalid_surface"),
+            ("surface", {}, "invalid_surface"),
+            ("episode_started_at", "0001-01-01T00:00:00+01:00", "invalid_episode_started_at"),
+        ):
+            with self.subTest(field=field, value=value):
+                body = task_body()
+                body[field] = value
+                queue = FakeQueue(body)
+                result = consume_one(queue, lambda task: self.fail("must not process"))
+                self.assertEqual(result.outcome, "dead_lettered")
+                self.assertEqual(queue.actions, [
+                    ("dead_letter", "receipt-1", f"invalid_task:{reason}")
+                ])
 
     def test_processing_errors_retry_without_leaking_details(self):
         for error in (

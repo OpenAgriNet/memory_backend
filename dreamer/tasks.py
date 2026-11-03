@@ -92,7 +92,10 @@ def _aware_timestamp(
             else f"{code}_needs_timezone"
         )
         raise TaskValidationError(timezone_code)
-    parsed = parsed.astimezone(timezone.utc)
+    try:
+        parsed = parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError) as exc:
+        raise TaskValidationError(code) from exc
     return parsed.isoformat().replace("+00:00", "Z"), parsed
 
 
@@ -160,7 +163,7 @@ class MemoryTask:
             raise TaskValidationError("unsupported_schema_version")
 
         surface = payload.get("surface")
-        if surface not in _SURFACES:
+        if not isinstance(surface, str) or surface not in _SURFACES:
             raise TaskValidationError("invalid_surface")
         episode_number = _positive_int(
             payload.get("episode_number"), "invalid_episode_number"
