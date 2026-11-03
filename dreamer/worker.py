@@ -35,13 +35,13 @@ class _FileQueue:
         return QueueMessage("local-task", self.body)
 
     def acknowledge(self, receipt: str) -> None:
-        self.action = "acknowledged"
+        pass
 
     def retry(self, receipt: str, reason: str) -> None:
-        self.action = "retry"
+        pass
 
     def dead_letter(self, receipt: str, reason: str) -> None:
-        self.action = "dead_letter"
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
