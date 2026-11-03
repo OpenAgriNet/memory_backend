@@ -184,40 +184,14 @@ never copied into memory or these docs. Langfuse access is read-only.
 
 ### Queue worker boundary
 
-New background orchestration must adapt source telemetry into the normalized
-`dreamer.tasks.MemoryTask` v2 contract before enqueueing it. The queue worker never
-reads Langfuse field names directly. A task contains one bounded part of a completed,
-numbered conversation episode: its farmer, chat/voice surface, source session,
-episode number and revision, episode bounds, ordered turns, and the trace IDs that
-are new in this revision. It derives an exact-payload task key and a stable
-farmer/surface/session/episode subject key for idempotency and safe logging without
-exposing farmer IDs or conversation text. Reopening the same source session later
-uses a new immutable episode number; revisions and bounded parts retain the same
-episode subject.
+A v2 message describes one part of a farmer's numbered chat or voice episode.
+It carries ordered turns and identifies which traces are newly pending. The
+episode key is shared across parts and revisions. The task key identifies the
+exact message for safe redelivery.
 
-The contract accepts only a canonical 10-digit farmer mobile. It does not trim or
-repair identities and rejects anonymous, path-like, oversized, or otherwise invalid
-values. The producer owns the trust decision before creating that task. The current
-adapter uses the fields available on main and applies the extra identity/persona
-matching described below; its remaining authentication limitation is explicit.
-
-Tasks are bounded before model work: 1–100 chronologically ordered turns, at most
-256 KiB of canonical UTF-8 JSON, 8,000 query characters per turn, 16,000 answer
-characters per turn, and 128,000 aggregate query/answer characters. Larger episodes
-must be split by the producer into ordered parts under the same episode number.
-Pending trace IDs must be a non-empty subset of that part's turns. Session and trace
-identifiers are bounded to 200 safe characters; source labels are allowlisted and
-bounded to 64. Episode/turn timestamps are normalized to UTC before keys are
-calculated. Log summaries hash the source label and omit the session, farmer and
-conversation text.
-
-`dreamer.queue_worker.consume_one` defines the broker boundary: receive,
-acknowledge, retry, and dead-letter. It acknowledges only after processing
-succeeds. `dreamer.redis_queue.RedisStreamTaskQueue` supplies the Redis Streams
-transport, including visibility recovery, bounded retries, deduplication, and a
-separate dead-letter stream. Retryable failures use a Redis sorted-set delay before
-returning to the stream. Changing trace names or metadata does not change extraction
-or storage code.
+A message is limited to 100 turns, 128,000 conversation characters, and 256 KiB.
+The worker acknowledges success, retries temporary failures, and dead-letters
+invalid messages and permanent failures.
 
 ### Closed conversation-episode producer
 
@@ -244,7 +218,6 @@ Offline, with no service/model calls:
 python3 -m unittest discover -s tests -p 'test_unit.py'
 python3 -m unittest discover -s tests -p 'test_review_regressions.py'
 python3 -m unittest discover -s tests -p 'test_bot_tools.py'
-python3 -m unittest discover -s tests -p 'test_queue_worker.py'
 ```
 
 `tests/test_service.py` writes synthetic records only when `AMUL_MEMORY_INTEGRATION=1`.

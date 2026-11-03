@@ -565,6 +565,7 @@ async def _store_entry(
     previous_version: str | None = None,
     record_kind: Literal["matter", "episode"] = "matter",
     system_fields: dict[str, Any] | None = None,
+    point_id: str | None = None,
     dedupe_headline: bool = True,
 ) -> dict:
     """Version links are generated only by the checked update path, never POST input."""
@@ -598,7 +599,7 @@ async def _store_entry(
         # describe several independent situations. Semantic matching is the
         # writer's decision; a storage guard must not silently discard them.
 
-    point_id = str(uuid.uuid4())
+    point_id = point_id or str(uuid.uuid4())
     payload = {
         "farmer_id": farmer_id,
         "type": MEMORY_TYPE,
@@ -728,6 +729,26 @@ async def put_episode_summary(
     ):
         raise HTTPException(422, "invalid episode trace provenance")
 
+    point_id = str(uuid.uuid5(
+        uuid.NAMESPACE_URL, f"amul-episode:{subject_key}:{summary.episode_revision}:{summary.part_number}"
+    ))
+    request_hash = hashlib.sha256(summary.model_dump_json().encode()).hexdigest()
+    pending_result = await _qdrant("POST", f"/collections/{COLLECTION}/points/scroll", {
+        "filter": {"must": [
+            {"key": "farmer_id", "match": {"value": farmer_id}},
+            {"key": "episode_subject_key", "match": {"value": subject_key}},
+            {"key": "episode_staged", "match": {"value": True}},
+        ]},
+        "limit": 1, "with_payload": True, "with_vector": False,
+    })
+    staged = pending_result["result"]["points"]
+    if staged:
+        point = staged[0]
+        payload = point["payload"]
+        if point["id"] != point_id or payload.get("episode_request_hash") != request_hash:
+            raise HTTPException(409, "another episode update is awaiting publication")
+        return await _publish_episode_summary(point)
+
     current = await _current_episode_summary(farmer_id, subject_key)
     old = current["payload"] if current else None
     old_revision = int((old or {}).get("episode_revision") or 0)
@@ -773,8 +794,13 @@ async def put_episode_summary(
         exclude_id=current["id"] if current else None,
         previous_version=current["id"] if current else None,
         record_kind="episode",
+        point_id=point_id,
         system_fields={
             "episode_subject_key": subject_key,
+            "episode_staged": True,
+            "episode_request_hash": request_hash,
+            "superseded_at": _now(),
+            "previous_chunk_count": (old or {}).get("chunk_count", 0),
             "source_surface": summary.surface,
             "source_episode_number": summary.episode_number,
             "episode_revision": summary.episode_revision,
@@ -785,13 +811,20 @@ async def put_episode_summary(
         },
         dedupe_headline=False,
     )
-    if current:
+    return await _publish_episode_summary(stored)
+
+
+async def _publish_episode_summary(point):
+    payload = point["payload"]
+    await _require_memory_enabled(payload["farmer_id"])
+    if previous := payload.get("previous_version"):
         await _retire(
-            current["id"],
-            old,
-            {"superseded_at": _now(), "superseded_by": stored["id"]},
+            previous,
+            {"chunk_count": payload["previous_chunk_count"]},
+            {"superseded_at": payload["superseded_at"], "superseded_by": point["id"]},
         )
-    return {"id": stored["id"], "applied": True, "unchanged": False}
+    await _retire(point["id"], payload, {"superseded_at": None, "episode_staged": False})
+    return {"id": point["id"], "applied": True, "unchanged": False}
 
 
 def _chunk_id(entry_id, number):
