@@ -268,7 +268,9 @@ class MemoryTask:
     @property
     def subject_key(self) -> str:
         """Opaque stable key for one numbered episode across revisions and parts."""
-        subject = (
-            f"{self.farmer_id}\0{self.surface}\0{self.session_id}\0{self.episode_number}"
-        ).encode("utf-8")
-        return hashlib.sha256(subject).hexdigest()
+        return episode_subject_key(self.farmer_id, self.surface, self.session_id, self.episode_number)
+
+
+def episode_subject_key(farmer_id: str, surface: str, session_id: str, number: int) -> str:
+    subject = f"{farmer_id}\0{surface}\0{session_id}\0{number}".encode("utf-8")
+    return hashlib.sha256(subject).hexdigest()

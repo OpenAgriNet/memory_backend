@@ -15,12 +15,14 @@ from typing import Any, Mapping, Protocol
 from dotenv import load_dotenv
 
 if __package__:
+    from .memory_client import memory_policy
     from .episode_ledger import EpisodeRecord, MemoryEpisodeLedger, RedisEpisodeLedger, SessionRecord, TraceRecord
     from .identity import content_fingerprint, farmer_key, opaque_key, trace_key
     from .lf import CHAT_SCHEMA_VERSION, CHAT_TRACE_NAME, TURN_SCHEMA_VERSION, TURN_TRACE_NAME, LangfuseRO
     from .redis_queue import RedisStreamTaskQueue
     from .tasks import MAX_ANSWER_CHARS, MAX_CONTENT_CHARS, MAX_QUERY_CHARS, MAX_TURNS, MemoryTask, TASK_SCHEMA_VERSION, TaskValidationError
 else:
+    from memory_client import memory_policy
     from episode_ledger import EpisodeRecord, MemoryEpisodeLedger, RedisEpisodeLedger, SessionRecord, TraceRecord
     from identity import content_fingerprint, farmer_key, opaque_key, trace_key
     from lf import CHAT_SCHEMA_VERSION, CHAT_TRACE_NAME, TURN_SCHEMA_VERSION, TURN_TRACE_NAME, LangfuseRO
@@ -451,6 +453,15 @@ def produce_once(
         if config.allowlist_enabled and farmer_id not in config.farmer_allowlist:
             restricted += 1
             continue
+        if not config.dry_run and isinstance(ledger, RedisEpisodeLedger):
+            policy = memory_policy(farmer_id)
+            if policy.erase_in_progress or not policy.enabled:
+                skipped["memory_disabled"] += 1
+                continue
+            if policy.erase_cutoff is not None:
+                trusted = [trace for trace in trusted if trace.observed_at > policy.erase_cutoff]
+                if not trusted:
+                    continue
         trusted = list({
             trace.trace_id: trace
             for trace in sorted(trusted, key=lambda item: (item.observed_at, item.trace_id))

@@ -14,6 +14,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 export MEMORY_API_URL="${MEMORY_API_URL:-http://localhost:8100}"
 export MEMORY_INTERNAL_TOKEN="${MEMORY_INTERNAL_TOKEN:-offline-test-token-32-characters-minimum}"
+export MEMORY_ID_HASH_KEY="${MEMORY_ID_HASH_KEY:-offline-id-hash-key-32-characters-minimum}"
 export QDRANT_HTTP="${QDRANT_HTTP:-http://localhost:6350}"
 export AMUL_OAN_API_PATH="${AMUL_OAN_API_PATH:-/amulpfsdata/gautam/amul-oan-api}"
 echo "memory service: $MEMORY_API_URL"

@@ -216,6 +216,24 @@ Older chat telemetry may derive identity from a request value. The producer
 cannot verify which path emitted an old trace. See issue #362 for the telemetry
 contract and rollout requirements.
 
+### Per-phone erasure
+
+The operator command is read-only unless `--execute` is present:
+
+```bash
+python -m dreamer.erase_farmer --farmer-id 9876543210
+python -m dreamer.erase_farmer --farmer-id 9876543210 --execute \
+  --confirm-phone 9876543210 --workers-paused
+```
+
+Before execution, pause the producer and all workers and wait for in-flight work to stop. The command first retains an
+explicit `memory_enabled=false` settings tombstone, then removes that phone's memory
+points (including episode summaries and revisions), episode task state and ledgers,
+Redis stream/retry/dead-letter tasks, and related deduplication markers. It verifies the result and is safe to rerun after a partial
+failure. Output contains only the HMAC farmer key, counts, and fixed outcome fields.
+A durable cutoff prevents older Langfuse turns from returning after opt-in.
+Memory cannot be enabled while an erase is incomplete. Rerun the command to finish it.
+
 ## Verification
 
 Offline, with no service/model calls:

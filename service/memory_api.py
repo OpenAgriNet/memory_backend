@@ -52,11 +52,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 if __package__:
     from . import episode, profile_schema
-    from .runtime_config import bearer_token_is_safe, memory_internal_token, required, qdrant_headers
+    from .runtime_config import bearer_token_is_safe, memory_erase_point_id, memory_internal_token, required, qdrant_headers
 else:
     import profile_schema
     import episode
-    from runtime_config import bearer_token_is_safe, memory_internal_token, required, qdrant_headers
+    from runtime_config import bearer_token_is_safe, memory_erase_point_id, memory_internal_token, required, qdrant_headers
 
 QDRANT_URL = required("QDRANT_URL").rstrip("/")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "amul_memory")
@@ -92,7 +92,7 @@ EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", f"marqo:{MARQO_INDEX}/doc-query")
 # records with category values remain readable and become plain memories on update.
 MEMORY_TYPE = "memory"
 CHUNK_TYPE = "memory_chunk"
-INTERNAL_TYPES = ("settings", "profile_record", "key_doc", CHUNK_TYPE)
+INTERNAL_TYPES = ("memory_erase", "settings", "profile_record", "key_doc", CHUNK_TYPE)
 EntryStatus = Literal["open", "resolved", "pending", "n/a"]
 
 # A farmer's memory-on/off flag is stored here, in Qdrant, alongside their own
@@ -530,17 +530,28 @@ def _settings_point_id(farmer_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"amul-memory-settings:{farmer_id}"))
 
 
-async def _memory_enabled_strict(farmer_id: str) -> bool:
-    """Read the authoritative setting; callers decide how lookup failure is handled."""
+async def _memory_policy(farmer_id: str) -> dict:
+    settings_id = _settings_point_id(farmer_id)
+    erase_id = memory_erase_point_id(farmer_id)
     got = await _qdrant(
-        "POST",
-        f"/collections/{COLLECTION}/points",
-        {"ids": [_settings_point_id(farmer_id)], "with_payload": True},
+        "POST", f"/collections/{COLLECTION}/points",
+        {"ids": [settings_id, erase_id], "with_payload": True},
     )
-    points = got.get("result") or []
-    if not points:
-        return DEFAULT_MEMORY_ENABLED
-    return points[0].get("payload", {}).get("memory_enabled", DEFAULT_MEMORY_ENABLED) is True
+    enabled = DEFAULT_MEMORY_ENABLED
+    cutoff, erasing = None, False
+    for point in got.get("result") or []:
+        payload = point["payload"]
+        if point.get("id") == erase_id:
+            cutoff = payload["erase_cutoff"]
+            erasing = payload["erase_in_progress"]
+        else:
+            enabled = payload.get("memory_enabled", DEFAULT_MEMORY_ENABLED) is True
+    return {"memory_enabled": enabled and not erasing,
+            "erase_cutoff": cutoff, "erase_in_progress": erasing}
+
+
+async def _memory_enabled_strict(farmer_id: str) -> bool:
+    return (await _memory_policy(farmer_id))["memory_enabled"]
 
 
 async def _memory_enabled(farmer_id: str) -> bool:
@@ -1359,6 +1370,8 @@ async def put_settings(farmer_id: str, settings: MemorySettings) -> dict:
     there is exactly one place to look at (and list) who has memory enabled — no
     separate flag store to drift out of sync with the data.
     """
+    if settings.memory_enabled and (await _memory_policy(farmer_id))["erase_in_progress"]:
+        raise HTTPException(409, "memory erasure is in progress")
     payload = {
         "farmer_id": farmer_id,
         "type": SETTINGS_TYPE,
@@ -1382,10 +1395,10 @@ async def put_settings(farmer_id: str, settings: MemorySettings) -> dict:
 @app.get("/memory/{farmer_id}/settings")
 async def get_settings(farmer_id: str) -> dict:
     try:
-        enabled = await _memory_enabled_strict(farmer_id)
+        policy = await _memory_policy(farmer_id)
     except (HTTPException, httpx.HTTPError) as exc:
         raise HTTPException(503, "memory setting unavailable") from exc
-    return {"farmer_id": farmer_id, "memory_enabled": enabled}
+    return {"farmer_id": farmer_id, **policy}
 
 
 @app.get("/settings")

@@ -1,6 +1,7 @@
 """Environment configuration shared by the service and maintenance commands."""
 import os
 import re
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -67,3 +68,7 @@ def memory_api_headers(url):
     if configured_origin != target_origin:
         raise RuntimeError("Refusing to send Memory API credentials to another origin")
     return {"Authorization": f"Bearer {memory_internal_token()}"}
+
+
+def memory_erase_point_id(farmer_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"amul-memory-erase:{farmer_id}"))

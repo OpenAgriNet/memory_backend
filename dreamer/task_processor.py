@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, Literal, Protocol, Sequence
 
 if __package__:
@@ -79,22 +80,6 @@ def _worker_turn(
         "answer": turn.answer,
         "pending": turn.trace_id in pending_trace_ids,
     }
-
-
-def _memory_enabled(task: MemoryTask) -> bool:
-    """Check the authoritative service before any model or memory tool call."""
-    if __package__:
-        from . import dreamer
-    else:
-        import dreamer
-    response = memory_client.get(
-        f"{dreamer.MEMORY_API}/memory/{task.farmer_id}/settings", timeout=30
-    )
-    response.raise_for_status()
-    body = response.json()
-    if type(body.get("memory_enabled")) is not bool:
-        raise RuntimeError("invalid_memory_setting")
-    return body["memory_enabled"]
 
 
 def _previous_episode_summary(task: MemoryTask) -> dict[str, object] | None:
@@ -190,6 +175,21 @@ def process_task(
 ) -> ProcessResult:
     """Process one episode revision and never repeat an uncertain mutation."""
     try:
+        if settings_check is None:
+            policy = memory_client.memory_policy(task.farmer_id)
+            if policy.erase_in_progress or (
+                policy.erase_cutoff is not None
+                and datetime.fromisoformat(task.episode_started_at.replace("Z", "+00:00"))
+                <= policy.erase_cutoff
+            ):
+                return ProcessResult("no_op")
+            enabled = policy.enabled
+        else:
+            enabled = settings_check(task)
+    except Exception as exc:
+        raise RetryableTaskError("memory_setting_unavailable") from exc
+
+    try:
         begin = state_store.begin(task)
     except Exception as exc:
         raise RetryableTaskError("task_state_unavailable") from exc
@@ -235,12 +235,6 @@ def process_task(
         all_processed_by_key[key] for key in sorted(all_processed_by_key)
     )
 
-    check = settings_check or _memory_enabled
-    try:
-        enabled = check(task)
-    except Exception as exc:
-        _record_failure(state_store, task, "retryable")
-        raise RetryableTaskError("memory_setting_unavailable") from exc
     if not enabled:
         try:
             state_store.complete(task, "skipped", ())

@@ -1,12 +1,15 @@
 """Authenticated HTTP client for the private Memory API."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
+
 import requests
 
 try:
-    from service.runtime_config import memory_api_headers
+    from service.runtime_config import memory_api_headers, required
 except ImportError:  # Direct script execution adds service/ to sys.path.
-    from runtime_config import memory_api_headers
+    from runtime_config import memory_api_headers, required
 
 
 def _keep_bearer(request):
@@ -43,3 +46,27 @@ def put(url: str, **kwargs):
 
 def patch(url: str, **kwargs):
     return request("PATCH", url, **kwargs)
+
+
+@dataclass(frozen=True)
+class MemoryPolicy:
+    enabled: bool
+    erase_cutoff: datetime | None
+    erase_in_progress: bool
+
+
+def memory_policy(farmer_id: str) -> MemoryPolicy:
+    api = required("MEMORY_API_URL").rstrip("/")
+    response = get(f"{api}/memory/{farmer_id}/settings", timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    enabled = data["memory_enabled"]
+    erasing = data.get("erase_in_progress", False)
+    cutoff = data.get("erase_cutoff")
+    if type(enabled) is not bool or type(erasing) is not bool:
+        raise ValueError("invalid memory policy")
+    if cutoff is not None:
+        cutoff = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+        if cutoff.utcoffset() is None:
+            raise ValueError("invalid erase cutoff")
+    return MemoryPolicy(enabled, cutoff, erasing)

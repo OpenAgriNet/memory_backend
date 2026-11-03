@@ -204,22 +204,22 @@ class RedisEpisodeLedger:
         end
         local published = 0
         for index = 1, tonumber(ARGV[1]) do
-          local offset = 8 + ((index - 1) * 2)
+          local offset = 9 + ((index - 1) * 2)
           local task_key = ARGV[offset]
           local body = ARGV[offset + 1]
-          local marker = KEYS[6] .. ':' .. task_key
-          if redis.call('EXISTS', marker) == 0 then
+          local marker = KEYS[6] .. ':' .. ARGV[8] .. ':' .. task_key
+          if redis.call('EXISTS', marker, KEYS[6] .. ':' .. task_key) == 0 then
             redis.call('XADD', KEYS[5], '*',
               'body', body, 'attempts', '0', 'task_key', task_key)
             redis.call('SET', marker, '1', 'EX', ARGV[3])
             published = published + 1
           end
         end
-        local dead_start = 8 + 2 * tonumber(ARGV[1])
+        local dead_start = 9 + 2 * tonumber(ARGV[1])
         for index = dead_start + 2, #ARGV, 2 do
           redis.call('XADD', KEYS[7], 'MAXLEN', '~', ARGV[dead_start], '*',
             'body', '', 'attempts', '0', 'task_key', ARGV[index + 1],
-            'reason', ARGV[index], 'failed_at', ARGV[dead_start + 1])
+            'farmer_key', ARGV[8], 'reason', ARGV[index], 'failed_at', ARGV[dead_start + 1])
         end
         redis.call('SET', KEYS[1], ARGV[4])
         if tonumber(ARGV[7]) > 0 then
@@ -248,6 +248,7 @@ class RedisEpisodeLedger:
             key,
             _epoch(reconcile_at),
             _epoch(due_at) if due_at else 0,
+            farmer_hash,
             *payloads,
             publisher.max_length,
             datetime.now(timezone.utc).isoformat(),
