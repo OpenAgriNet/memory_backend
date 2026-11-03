@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, Literal, Protocol, Sequence
 
 if __package__:
@@ -16,10 +17,10 @@ else:
     from tasks import MemoryTask, SourceTurn
 
 StateOutcome = Literal["started", "completed", "deferred", "needs_review"]
-CompletionOutcome = Literal["completed", "no_op"]
+CompletionOutcome = Literal["completed", "no_op", "skipped"]
 FailureDisposition = Literal["retryable", "needs_review"]
 BeforeMutation = Callable[[], None]
-Runner = Callable[[MemoryTask, Sequence[list[dict[str, object]]], BeforeMutation], int]
+Runner = Callable[[MemoryTask, list[dict[str, object]], BeforeMutation], int]
 
 
 @dataclass(frozen=True)
@@ -81,10 +82,6 @@ def _worker_turn(
     }
 
 
-def _memory_enabled(task: MemoryTask) -> bool:
-    return memory_client.memory_enabled(task.farmer_id)
-
-
 def _previous_episode_summary(task: MemoryTask) -> dict[str, object] | None:
     if __package__:
         from . import dreamer
@@ -106,7 +103,7 @@ def _previous_episode_summary(task: MemoryTask) -> dict[str, object] | None:
 
 def _default_runner(
     task: MemoryTask,
-    chunks: Sequence[list[dict[str, object]]],
+    turns: list[dict[str, object]],
     before_mutation: BeforeMutation,
 ) -> int:
     if __package__:
@@ -115,54 +112,49 @@ def _default_runner(
         import agent
         import dreamer
 
-    writes = 0
     uncertain_mutation = False
     try:
         known_keys = dreamer._known_keys(strict=True)
         previous_episode_summary = _previous_episode_summary(task)
-        for chunk in chunks:
-            pending_trace_ids = {
-                str(row["trace_id"]) for row in chunk if row.get("pending")
-            }
-            ctx = agent.dream(
-                dreamer.MEMORY_API,
-                task.farmer_id,
-                chunk,
-                source_ts=chunk[-1]["ts"],
-                session_id=task.session_id,
-                known_keys=known_keys,
-                verbose=False,
-                before_mutation=before_mutation,
-                pending_trace_ids=pending_trace_ids,
-                episode={
-                    "subject_key": task.subject_key,
-                    "surface": task.surface,
-                    "number": task.episode_number,
-                    "revision": task.episode_revision,
-                    "started_at": task.episode_started_at,
-                    "ended_at": task.episode_ended_at,
-                    "part_number": task.part_number,
-                    "part_count": task.part_count,
-                },
-                previous_episode_summary=previous_episode_summary,
-            )
-            landed = [
-                row for row in ctx.writes
-                if row.get("action") in ("write", "update", "fold", "episode")
-            ]
-            uncertain_mutation |= ctx.uncertain_mutation or bool(landed)
-            if not ctx.episode_summary_written:
-                raise RuntimeError("episode_summary_missing")
-            if ctx.error_code:
-                raise RuntimeError(ctx.error_code)
-            writes += len(landed)
-            if landed:
-                known_keys = dreamer._known_keys(strict=True)
+        pending_trace_ids = {
+            str(row["trace_id"]) for row in turns if row.get("pending")
+        }
+        ctx = agent.dream(
+            dreamer.MEMORY_API,
+            task.farmer_id,
+            turns,
+            source_ts=turns[-1]["ts"],
+            session_id=task.session_id,
+            known_keys=known_keys,
+            verbose=False,
+            before_mutation=before_mutation,
+            pending_trace_ids=pending_trace_ids,
+            episode={
+                "subject_key": task.subject_key,
+                "surface": task.surface,
+                "number": task.episode_number,
+                "revision": task.episode_revision,
+                "started_at": task.episode_started_at,
+                "ended_at": task.episode_ended_at,
+                "part_number": task.part_number,
+                "part_count": task.part_count,
+            },
+            previous_episode_summary=previous_episode_summary,
+        )
+        landed = [
+            row for row in ctx.writes
+            if row.get("action") in ("write", "update", "fold", "episode")
+        ]
+        uncertain_mutation |= ctx.uncertain_mutation or bool(landed)
+        if not ctx.episode_summary_written:
+            raise RuntimeError("episode_summary_missing")
+        if ctx.error_code:
+            raise RuntimeError(ctx.error_code)
+        return len(landed)
     except Exception as exc:
         error = RuntimeError("dreamer_runner_failed")
         error.uncertain_mutation = uncertain_mutation  # type: ignore[attr-defined]
         raise error from exc
-    return writes
 
 
 def _record_failure(
@@ -183,8 +175,17 @@ def process_task(
 ) -> ProcessResult:
     """Process one episode revision and never repeat an uncertain mutation."""
     try:
-        if not (settings_check or _memory_enabled)(task):
-            return ProcessResult("no_op")
+        if settings_check is None:
+            policy = memory_client.memory_policy(task.farmer_id)
+            if policy.erase_in_progress or (
+                policy.erase_cutoff is not None
+                and datetime.fromisoformat(task.episode_started_at.replace("Z", "+00:00"))
+                <= policy.erase_cutoff
+            ):
+                return ProcessResult("no_op")
+            enabled = policy.enabled
+        else:
+            enabled = settings_check(task)
     except Exception as exc:
         raise RetryableTaskError("memory_setting_unavailable") from exc
 
@@ -234,8 +235,15 @@ def process_task(
         all_processed_by_key[key] for key in sorted(all_processed_by_key)
     )
 
-    chunks = [worker_turns] if pending_trace_ids else []
-    if not chunks:
+    if not enabled:
+        try:
+            state_store.complete(task, "skipped", ())
+        except Exception as exc:
+            _record_failure(state_store, task, "retryable")
+            raise RetryableTaskError("task_completion_uncertain") from exc
+        return ProcessResult("no_op")
+
+    if not pending_trace_ids:
         try:
             state_store.complete(task, "no_op", all_processed)
         except Exception as exc:
@@ -245,7 +253,7 @@ def process_task(
 
     run = runner or _default_runner
     try:
-        writes = run(task, chunks, lambda: state_store.mark_writing(task))
+        writes = run(task, worker_turns, lambda: state_store.mark_writing(task))
     except Exception as exc:
         uncertain = bool(getattr(exc, "uncertain_mutation", False))
         disposition: FailureDisposition = "needs_review" if uncertain else "retryable"
@@ -261,4 +269,4 @@ def process_task(
         _record_failure(state_store, task, disposition)
         error_type = PermanentTaskError if writes else RetryableTaskError
         raise error_type("task_completion_uncertain") from exc
-    return ProcessResult(outcome, processed_chunks=len(chunks), writes=writes)
+    return ProcessResult(outcome, processed_chunks=1, writes=writes)

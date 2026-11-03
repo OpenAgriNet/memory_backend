@@ -6,24 +6,24 @@ import json
 import os
 import re
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Mapping, Protocol
 
 from dotenv import load_dotenv
 
 if __package__:
+    from .memory_client import memory_policy
     from .episode_ledger import EpisodeRecord, MemoryEpisodeLedger, RedisEpisodeLedger, SessionRecord, TraceRecord
-    from .memory_client import memory_enabled
     from .identity import content_fingerprint, farmer_key, opaque_key, trace_key
     from .lf import CHAT_SCHEMA_VERSION, CHAT_TRACE_NAME, TURN_SCHEMA_VERSION, TURN_TRACE_NAME, LangfuseRO
     from .redis_queue import RedisStreamTaskQueue
     from .tasks import MAX_ANSWER_CHARS, MAX_CONTENT_CHARS, MAX_QUERY_CHARS, MAX_TURNS, MemoryTask, TASK_SCHEMA_VERSION, TaskValidationError
 else:
+    from memory_client import memory_policy
     from episode_ledger import EpisodeRecord, MemoryEpisodeLedger, RedisEpisodeLedger, SessionRecord, TraceRecord
-    from memory_client import memory_enabled
     from identity import content_fingerprint, farmer_key, opaque_key, trace_key
     from lf import CHAT_SCHEMA_VERSION, CHAT_TRACE_NAME, TURN_SCHEMA_VERSION, TURN_TRACE_NAME, LangfuseRO
     from redis_queue import RedisStreamTaskQueue
@@ -304,13 +304,13 @@ def _assign(record: SessionRecord, trace: ObservedTrace, inactivity: int) -> Epi
     else:
         episode = EpisodeRecord(
             max((item.number for item in record.episodes), default=0) + 1,
-            _iso(trace.observed_at), _iso(trace.observed_at), _iso(trace.observed_at),
+            _iso(trace.observed_at), _iso(trace.observed_at),
         )
         record.episodes.append(episode)
     start = min(_timestamp(episode.started_at), trace.observed_at)
     end = max(_timestamp(episode.ended_at), trace.observed_at)
     assert start is not None and end is not None
-    episode.started_at, episode.ended_at, episode.last_activity_at = _iso(start), _iso(end), _iso(end)
+    episode.started_at, episode.ended_at = _iso(start), _iso(end)
     return episode
 
 
@@ -397,7 +397,6 @@ def produce_once(
     ledger: Any | None = None,
     now: datetime | None = None,
     adapter: CurrentMainTelemetryAdapter | None = None,
-    settings_check: Callable[[str], bool] | None = None,
 ) -> ScanResult:
     now = (now or _utc_now()).astimezone(timezone.utc)
     adapter = adapter or CurrentMainTelemetryAdapter()
@@ -407,29 +406,34 @@ def produce_once(
     scan_start = max(cutoff, watermark - timedelta(seconds=config.scan_seconds) if watermark else cutoff)
     recent = source.recent(scan_start, now)
     skipped: Counter[str] = Counter()
-    discovered: dict[tuple[str, str, str], list[ObservedTrace]] = defaultdict(list)
+    discovered: set[tuple[str, str, str]] = set()
     for row in recent:
         trace, reason = adapter.trace(row) if isinstance(row, Mapping) else (None, "invalid_trace")
         if trace is None:
             skipped[reason] += 1
         elif cutoff <= trace.observed_at <= now:
-            discovered[(trace.farmer_id, trace.surface, trace.session_id)].append(trace)
+            discovered.add((trace.farmer_id, trace.surface, trace.session_id))
         else:
             skipped["outside_event_window"] += 1
 
-    records_by_key: dict[str, SessionRecord] = {}
+    records_by_key = {}
     for key in set(ledger.due(now)) | set(ledger.reconcile_due(now)):
-        record = ledger.load(key)
-        if record is not None:
-            records_by_key[key] = record
+        raw = ledger.snapshot(key)
+        if raw is not None:
+            records_by_key[key] = SessionRecord.from_json(raw), raw
     for farmer_id, surface, session_id in discovered:
         key = _ledger_key(farmer_id, surface, session_id)
-        records_by_key.setdefault(key, ledger.load(key) or SessionRecord(surface, session_id))
+        if key not in records_by_key:
+            raw = ledger.snapshot(key)
+            record = SessionRecord.from_json(raw) if raw is not None else SessionRecord(surface, session_id)
+            records_by_key[key] = record, raw
 
     sessions_seen = episodes_closed = turns_eligible = late_revisions = split_episodes = 0
     zero_eligible = restricted = would_publish = published = duplicates = 0
-    for expected_key, record in records_by_key.items():
-        rows = source.session(record.session_id, cutoff, now)
+    stale_scan = False
+    for expected_key, (record, snapshot) in records_by_key.items():
+        context_start = min([cutoff, *(_timestamp(episode.started_at) for episode in record.episodes)])
+        rows = source.session(record.session_id, context_start, now)
         trusted: list[ObservedTrace] = []
         for row in rows:
             trace, reason = adapter.trace(row) if isinstance(row, Mapping) else (None, "invalid_trace")
@@ -449,15 +453,24 @@ def produce_once(
         if config.allowlist_enabled and farmer_id not in config.farmer_allowlist:
             restricted += 1
             continue
-        if settings_check is not None and not settings_check(farmer_id):
-            skipped["memory_disabled"] += 1
-            continue
-        farmer_hash = farmer_key(farmer_id)
+        if not config.dry_run and isinstance(ledger, RedisEpisodeLedger):
+            policy = memory_policy(farmer_id)
+            if policy.erase_in_progress or not policy.enabled:
+                skipped["memory_disabled"] += 1
+                continue
+            if policy.erase_cutoff is not None:
+                trusted = [trace for trace in trusted if trace.observed_at > policy.erase_cutoff]
+                if not trusted:
+                    continue
         trusted = list({
             trace.trace_id: trace
             for trace in sorted(trusted, key=lambda item: (item.observed_at, item.trace_id))
         }.values())
+        known_traces = {key for episode in record.episodes for key in episode.traces}
+        dead_letters = []
         for trace in trusted:
+            if trace.observed_at < cutoff and trace_key(trace.trace_id) not in known_traces:
+                continue
             episode = _assign(record, trace, config.inactivity_seconds)
             hashed = trace_key(trace.trace_id)
             previous = episode.traces.get(hashed)
@@ -471,8 +484,8 @@ def produce_once(
             ):
                 skipped["oversized_turn"] += 1
                 if publisher is not None and not config.dry_run:
-                    publisher.publish_producer_dead_letter(
-                        "oversized_turn", opaque_key("trace", expected_key, trace.trace_id), farmer_hash
+                    dead_letters.append(
+                        ("oversized_turn", opaque_key("trace", expected_key, trace.trace_id))
                     )
                     episode.traces[hashed].published_fingerprint = trace.fingerprint
 
@@ -480,7 +493,7 @@ def produce_once(
         tasks: list[MemoryTask] = []
         touched: list[tuple[EpisodeRecord, list[ObservedTrace]]] = []
         for episode in sorted(record.episodes, key=lambda item: item.number):
-            last_activity = _timestamp(episode.last_activity_at)
+            last_activity = _timestamp(episode.ended_at)
             assert last_activity is not None
             closes_at = last_activity + timedelta(seconds=config.inactivity_seconds)
             if closes_at > now:
@@ -495,13 +508,19 @@ def produce_once(
                 if episode.revision == 0:
                     zero_eligible += 1
                 continue
+            available = {trace_key(trace.trace_id) for trace in episode_rows if trace.eligible}
+            if any(
+                saved.eligible and saved.published_fingerprint and key not in available
+                for key, saved in episode.traces.items()
+            ):
+                skipped["missing_episode_context"] += 1
+                due_at = min(due_at, now) if due_at else now
+                continue
             built, error = _build_tasks(episode, episode_rows)
             if error:
                 skipped["oversized_turn" if len(pending_rows) == 1 else error] += 1
                 if publisher is not None and not config.dry_run:
-                    publisher.publish_producer_dead_letter(
-                        error, opaque_key("episode", expected_key, str(episode.number)), farmer_hash
-                    )
+                    dead_letters.append((error, opaque_key("episode", expected_key, str(episode.number))))
                 continue
             episodes_closed += 1
             late_revisions += int(episode.revision > 0)
@@ -515,23 +534,29 @@ def produce_once(
             continue
         if publisher is None:
             raise RuntimeError("publisher is required when dry-run is disabled")
+        farmer_hash = farmer_key(farmer_id)
         if tasks:
             for episode, pending_rows in touched:
                 episode.revision += 1
                 for trace in pending_rows:
                     episode.traces[trace_key(trace.trace_id)].published_fingerprint = trace.fingerprint
-            added, repeated = ledger.commit(expected_key, farmer_hash, record, tasks, publisher, due_at, reconcile_at)
-            published += added
-            duplicates += repeated
         else:
-            latest = max((_timestamp(item.last_activity_at) for item in record.episodes), default=now)
-            within_horizon = latest >= now - timedelta(seconds=config.reconcile_horizon_seconds)
-            ledger.save(
-                expected_key, farmer_hash, record, due_at,
-                reconcile_at if within_horizon else datetime.max.replace(tzinfo=timezone.utc),
-            )
+            latest = max((_timestamp(item.ended_at) for item in record.episodes), default=now)
+            if latest < now - timedelta(seconds=config.reconcile_horizon_seconds):
+                reconcile_at = datetime.max.replace(tzinfo=timezone.utc)
+        result = ledger.commit(
+            expected_key, farmer_hash, record, tasks, publisher, due_at, reconcile_at,
+            expected=snapshot, dead_letters=dead_letters,
+        )
+        if result is None:
+            stale_scan = True
+            skipped["stale_episode_ledger"] += 1
+            continue
+        added, repeated = result
+        published += added
+        duplicates += repeated
 
-    if not config.dry_run and publisher is not None:
+    if not stale_scan and not config.dry_run and publisher is not None:
         publisher.advance_watermark(now)
     return ScanResult(
         len(recent), sessions_seen, episodes_closed, turns_eligible, late_revisions,
@@ -545,9 +570,7 @@ def _run_once(config: ProducerConfig) -> ScanResult:
     if config.dry_run:
         return produce_once(source, None, config, ledger=MemoryEpisodeLedger())
     queue = RedisStreamTaskQueue()
-    return produce_once(
-        source, queue, config, ledger=RedisEpisodeLedger(queue.client), settings_check=memory_enabled
-    )
+    return produce_once(source, queue, config, ledger=RedisEpisodeLedger(queue.client))
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -7,6 +7,7 @@ import os
 import re
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
@@ -18,13 +19,13 @@ if __package__:
     from .episode_ledger import RedisEpisodeLedger
     from .identity import farmer_key, validate_farmer_id
     from .tasks import MemoryTask, TaskValidationError, episode_subject_key
-    from service.runtime_config import qdrant_headers, required
+    from service.runtime_config import memory_erase_point_id, qdrant_headers, required
 else:
     import memory_client
     from episode_ledger import RedisEpisodeLedger
     from identity import farmer_key, validate_farmer_id
     from tasks import MemoryTask, TaskValidationError, episode_subject_key
-    from runtime_config import qdrant_headers, required
+    from runtime_config import memory_erase_point_id, qdrant_headers, required
 
 
 load_dotenv(
@@ -116,7 +117,7 @@ class QdrantEraseStore:
 
     def _memory_filter(self, farmer_id: str) -> dict[str, Any]:
         result = self._farmer_filter(farmer_id)
-        result["must_not"] = [{"has_id": [self._settings_point_id(farmer_id)]}]
+        result["must_not"] = [{"has_id": [self._settings_point_id(farmer_id), memory_erase_point_id(farmer_id)]}]
         return result
 
     @staticmethod
@@ -174,7 +175,33 @@ class QdrantEraseStore:
             task_keys=self._state_markers(state_filter) if state_exists else (),
         )
 
+    def _erase_record(self, farmer_id: str) -> dict:
+        path = f"/collections/{self.memory_collection}/points"
+        points = self._request("POST", path, {
+            "ids": [memory_erase_point_id(farmer_id)], "with_payload": True,
+        })["result"]
+        return points[0]["payload"] if points else {}
+
+    def finish_erase(self, farmer_id: str) -> None:
+        path = f"/collections/{self.memory_collection}/points/payload?wait=true"
+        self._request("POST", path, {
+            "points": [memory_erase_point_id(farmer_id)],
+            "payload": {"erase_in_progress": False},
+        })
+        record = self._erase_record(farmer_id)
+        if not record.get("erase_cutoff") or record.get("erase_in_progress") is not False:
+            raise RuntimeError("erase cutoff was not retained")
+
     def disable(self, farmer_id: str) -> None:
+        record = self._erase_record(farmer_id)
+        if not record.get("erase_in_progress"):
+            self._request("PUT", f"/collections/{self.memory_collection}/points?wait=true", {
+                "points": [{
+                    "id": memory_erase_point_id(farmer_id), "vector": {},
+                    "payload": {"type": "memory_erase", "erase_in_progress": True,
+                                "erase_cutoff": datetime.now(timezone.utc).isoformat()},
+                }],
+            })
         response = memory_client.put(
             f"{self.memory_api}/memory/{farmer_id}/settings",
             json={"memory_enabled": False, "note": "erasure_requested"},
@@ -183,11 +210,10 @@ class QdrantEraseStore:
         response.raise_for_status()
 
     def settings_disabled(self, farmer_id: str) -> bool:
-        response = memory_client.get(
-            f"{self.memory_api}/memory/{farmer_id}/settings", timeout=30
-        )
-        response.raise_for_status()
-        return response.json().get("memory_enabled") is False
+        points = self._request("POST", f"/collections/{self.memory_collection}/points", {
+            "ids": [self._settings_point_id(farmer_id)], "with_payload": True,
+        })["result"]
+        return bool(points) and points[0]["payload"].get("memory_enabled") is False
 
     def delete_memory(self, farmer_id: str) -> None:
         self._request(
@@ -434,6 +460,10 @@ def erase_farmer(
             raise RuntimeError("erase verification failed")
     except Exception as exc:
         raise EraseFailure("verification", exc) from exc
+    try:
+        qdrant.finish_erase(identity)
+    except Exception as exc:
+        raise EraseFailure("finish_erase", exc) from exc
     return _safe_result(identity_key, qdrant_plan, redis_plan, "erased")
 
 

@@ -58,6 +58,7 @@ class FakeQdrant:
         )
 
     def disable(self, _phone):
+        self.erase_finished = False
         self.actions.append("disable")
         self.disabled = True
 
@@ -71,6 +72,9 @@ class FakeQdrant:
     def delete_memory(self, _phone):
         self.actions.append("memory")
         self.memory_points = 0
+
+    def finish_erase(self, _phone):
+        self.erase_finished = True
 
     def settings_disabled(self, _phone):
         return self.disabled
@@ -213,7 +217,7 @@ class EraseContract(unittest.TestCase):
         filter_store = object.__new__(erase.QdrantEraseStore)
         self.assertEqual(
             filter_store._memory_filter(PHONE)["must_not"],
-            [{"has_id": [filter_store._settings_point_id(PHONE)]}],
+            [{"has_id": [filter_store._settings_point_id(PHONE), erase.memory_erase_point_id(PHONE)]}],
         )
 
     def test_redis_removes_stream_retry_dead_letter_and_markers(self):
@@ -256,6 +260,7 @@ class EraseContract(unittest.TestCase):
             qdrant=qdrant, redis=queue,
         )
         self.assertEqual(recovered["outcome"], "erased")
+        self.assertTrue(qdrant.erase_finished)
 
 
 if __name__ == "__main__":

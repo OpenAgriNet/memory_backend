@@ -23,7 +23,7 @@ from runtime_config import required, qdrant_headers
 
 QDRANT = required("QDRANT_URL").rstrip("/")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "amul_memory")
-SKIP_TYPES = {"settings", "key_doc", "profile_record"}
+SKIP_TYPES = {"settings", "key_doc", "profile_record", "memory_erase"}
 
 
 def _call(method, path, body=None):

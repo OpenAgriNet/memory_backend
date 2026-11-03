@@ -166,6 +166,8 @@ class QdrantTaskStateStore:
         self._ensure_ready()
         current = self._read(task.subject_key)
         processed = _processed(current)
+        if current and current.get("status") == "skipped":
+            return BeginResult("completed")
         if current and task.task_key in current.get("completed_task_keys", []):
             return BeginResult("completed", processed)
         if current and current.get("status") == "needs_review":
@@ -307,7 +309,7 @@ class QdrantTaskStateStore:
         self, task: MemoryTask, outcome: CompletionOutcome,
         processed_turns: Sequence[ProcessedTurn],
     ) -> None:
-        self._transition(task, outcome, processed_turns)
+        self._transition(task, outcome, None if outcome == "skipped" else processed_turns)
 
     def fail(self, task: MemoryTask, disposition: FailureDisposition) -> None:
         self._transition(task, disposition)

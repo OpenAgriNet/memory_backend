@@ -79,7 +79,7 @@ def _positive_int(value: Any, code: str) -> int:
 def _aware_timestamp(
     value: Any,
     code: str = "invalid_turn_timestamp",
-) -> tuple[str, datetime]:
+) -> str:
     timestamp = _bounded_string(value, code, 64)
     try:
         parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
@@ -92,8 +92,11 @@ def _aware_timestamp(
             else f"{code}_needs_timezone"
         )
         raise TaskValidationError(timezone_code)
-    parsed = parsed.astimezone(timezone.utc)
-    return parsed.isoformat().replace("+00:00", "Z"), parsed
+    try:
+        parsed = parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError) as exc:
+        raise TaskValidationError(code) from exc
+    return parsed.isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -109,7 +112,7 @@ class SourceTurn:
             raise TaskValidationError("turn_is_not_an_object")
         if set(payload) != _TURN_FIELDS:
             raise TaskValidationError("invalid_turn_fields")
-        timestamp, _ = _aware_timestamp(payload.get("timestamp"))
+        timestamp = _aware_timestamp(payload.get("timestamp"))
         return cls(
             trace_id=_identifier(payload.get("trace_id"), "invalid_trace_id", MAX_TRACE_ID_CHARS),
             timestamp=timestamp,
@@ -160,7 +163,7 @@ class MemoryTask:
             raise TaskValidationError("unsupported_schema_version")
 
         surface = payload.get("surface")
-        if surface not in _SURFACES:
+        if not isinstance(surface, str) or surface not in _SURFACES:
             raise TaskValidationError("invalid_surface")
         episode_number = _positive_int(
             payload.get("episode_number"), "invalid_episode_number"
@@ -173,12 +176,15 @@ class MemoryTask:
         if part_number > part_count:
             raise TaskValidationError("invalid_part_range")
 
-        episode_started_at, episode_start = _aware_timestamp(
+        episode_started_at = _aware_timestamp(
             payload.get("episode_started_at"), "invalid_episode_started_at"
         )
-        episode_ended_at, episode_end = _aware_timestamp(
+        episode_ended_at = _aware_timestamp(
             payload.get("episode_ended_at"), "invalid_episode_ended_at"
         )
+        # Canonical UTC timestamps sort chronologically without the trailing Z.
+        episode_start = episode_started_at.removesuffix("Z")
+        episode_end = episode_ended_at.removesuffix("Z")
         if episode_start > episode_end:
             raise TaskValidationError("invalid_episode_range")
 
@@ -192,7 +198,7 @@ class MemoryTask:
         trace_ids = [turn.trace_id for turn in turns]
         if len(trace_ids) != len(set(trace_ids)):
             raise TaskValidationError("duplicate_trace_id")
-        turn_order = [(_aware_timestamp(turn.timestamp)[1], turn.trace_id) for turn in turns]
+        turn_order = [(turn.timestamp.removesuffix("Z"), turn.trace_id) for turn in turns]
         if turn_order != sorted(turn_order):
             raise TaskValidationError("turns_not_chronological")
         if any(not episode_start <= timestamp <= episode_end for timestamp, _ in turn_order):
@@ -263,22 +269,6 @@ class MemoryTask:
     def subject_key(self) -> str:
         """Opaque stable key for one numbered episode across revisions and parts."""
         return episode_subject_key(self.farmer_id, self.surface, self.session_id, self.episode_number)
-
-    def redacted_summary(self) -> dict[str, Any]:
-        """Return task information safe for structured logs and metrics."""
-        return {
-            "schema_version": self.schema_version,
-            "task_key": self.task_key,
-            "subject_key": self.subject_key,
-            "source_key": hashlib.sha256(self.source.encode("utf-8")).hexdigest(),
-            "surface": self.surface,
-            "episode_number": self.episode_number,
-            "episode_revision": self.episode_revision,
-            "part_number": self.part_number,
-            "part_count": self.part_count,
-            "turn_count": len(self.turns),
-            "pending_turn_count": len(self.pending_trace_ids),
-        }
 
 
 def episode_subject_key(farmer_id: str, surface: str, session_id: str, number: int) -> str:

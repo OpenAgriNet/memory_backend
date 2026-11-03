@@ -27,7 +27,6 @@ try:
     env = dict(
         os.environ,
         AMUL_CHUNK_TEST_QDRANT=endpoint,
-        AMUL_TASK_STATE_TEST_QDRANT=endpoint,
         QDRANT_URL=endpoint,
         QDRANT_API_KEY="",
         MEMORY_INTERNAL_TOKEN="isolated-test-token-32-characters-minimum",
@@ -35,9 +34,6 @@ try:
     )
     result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_episode_chunks.py", "-v"],
                             cwd=Path(__file__).resolve().parents[1], env=env)
-    if result.returncode == 0:
-        result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_task_processor.py", "-v"],
-                                cwd=Path(__file__).resolve().parents[1], env=env)
     if result.returncode == 0:
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))

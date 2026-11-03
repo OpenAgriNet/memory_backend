@@ -1,6 +1,7 @@
 """Environment configuration shared by the service and maintenance commands."""
 import os
 import re
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -58,12 +59,16 @@ def memory_internal_token():
     return token
 
 
-def memory_api_headers(url=None):
+def memory_api_headers(url):
     """Attach the service token only to the configured Memory API origin."""
     configured = urlsplit(required("MEMORY_API_URL"))
-    target = urlsplit(url or required("MEMORY_API_URL"))
+    target = urlsplit(url)
     configured_origin = (configured.scheme.lower(), configured.netloc.lower())
     target_origin = (target.scheme.lower(), target.netloc.lower())
     if configured_origin != target_origin:
         raise RuntimeError("Refusing to send Memory API credentials to another origin")
     return {"Authorization": f"Bearer {memory_internal_token()}"}
+
+
+def memory_erase_point_id(farmer_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"amul-memory-erase:{farmer_id}"))

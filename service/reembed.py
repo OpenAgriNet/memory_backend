@@ -25,7 +25,7 @@ MARQO = required("MARQO_URL").rstrip("/")
 MARQO_INDEX = os.getenv("MARQO_INDEX", "amul-veterinary-index")
 TARGET_STAMP = os.getenv("EMBED_MODEL_ID", f"marqo:{MARQO_INDEX}/doc-query")
 # Types whose vectors are placeholders, never searched — no point embedding them.
-PLACEHOLDER_TYPES = {"settings", "key_doc", "profile_record"}
+PLACEHOLDER_TYPES = {"settings", "key_doc", "profile_record", "memory_erase"}
 
 
 def _post(url, body, method="POST"):

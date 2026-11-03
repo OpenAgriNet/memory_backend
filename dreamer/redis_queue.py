@@ -17,13 +17,9 @@ from typing import Any
 from dotenv import load_dotenv
 
 if __package__:
-    from .identity import farmer_key
     from .queue_worker import QueueMessage
-    from .tasks import MemoryTask
 else:
-    from identity import farmer_key
     from queue_worker import QueueMessage
-    from tasks import MemoryTask
 
 
 _SAFE_KEY = re.compile(r"^[A-Za-z0-9:._-]+$")
@@ -138,31 +134,6 @@ class RedisStreamTaskQueue:
         except (TypeError, ValueError, OSError) as exc:
             raise RuntimeError("invalid producer watermark") from exc
 
-    def publish(self, task: MemoryTask) -> bool:
-        """Publish one task once per task key.
-
-        The Lua operation keeps the dedupe marker and XADD atomic.  False means
-        this exact task revision was already published.
-        """
-        body = json.dumps(
-            task.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-        )
-        script = """
-        local marker = KEYS[1]
-        if redis.call('EXISTS', marker) == 1 then
-          return 0
-        end
-        redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[1], '*',
-          'body', ARGV[2], 'attempts', '0', 'task_key', ARGV[3])
-        redis.call('SET', marker, '1', 'EX', ARGV[4])
-        return 1
-        """
-        marker = f"{self.dedupe_prefix}:{farmer_key(task.farmer_id)}:{task.task_key}"
-        return bool(self.client.eval(
-            script, 2, marker, self.stream,
-            self.max_length, body, task.task_key, self.dedupe_seconds,
-        ))
-
     def advance_watermark(self, value: datetime) -> None:
         milliseconds = int(value.astimezone(timezone.utc).timestamp() * 1000)
         script = """
@@ -182,7 +153,7 @@ class RedisStreamTaskQueue:
         )
         for _, member in ipairs(due) do
           local item = cjson.decode(member)
-          redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[2], '*',
+          redis.call('XADD', KEYS[2], '*',
             'body', item.body, 'attempts', tostring(item.attempts),
             'task_key', item.task_key, 'retry_reason', item.retry_reason)
           redis.call('ZREM', KEYS[1], member)
@@ -191,7 +162,7 @@ class RedisStreamTaskQueue:
         """
         self.client.eval(
             script, 2, self.retry_set, self.stream,
-            time.time(), self.max_length,
+            time.time(),
         )
 
     @staticmethod
@@ -319,7 +290,7 @@ class RedisStreamTaskQueue:
         pipe.execute()
         self._delivered.pop(receipt, None)
 
-    def publish_producer_dead_letter(self, reason: str, subject_key: str, farmer_hash: str) -> None:
+    def publish_producer_dead_letter(self, reason: str, subject_key: str) -> None:
         """Record a source task that cannot safely fit the queue contract."""
         self.client.xadd(
             self.dead_letter_stream,
@@ -327,7 +298,6 @@ class RedisStreamTaskQueue:
                 "body": "",
                 "attempts": "0",
                 "task_key": subject_key,
-                "farmer_key": farmer_hash,
                 "reason": reason,
                 "failed_at": _utc_now(),
             },
