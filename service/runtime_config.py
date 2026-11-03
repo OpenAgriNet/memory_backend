@@ -58,10 +58,10 @@ def memory_internal_token():
     return token
 
 
-def memory_api_headers(url=None):
+def memory_api_headers(url):
     """Attach the service token only to the configured Memory API origin."""
     configured = urlsplit(required("MEMORY_API_URL"))
-    target = urlsplit(url or required("MEMORY_API_URL"))
+    target = urlsplit(url)
     configured_origin = (configured.scheme.lower(), configured.netloc.lower())
     target_origin = (target.scheme.lower(), target.netloc.lower())
     if configured_origin != target_origin:

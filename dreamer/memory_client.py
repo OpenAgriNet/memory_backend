@@ -43,7 +43,3 @@ def put(url: str, **kwargs):
 
 def patch(url: str, **kwargs):
     return request("PATCH", url, **kwargs)
-
-
-def delete(url: str, **kwargs):
-    return request("DELETE", url, **kwargs)

@@ -129,7 +129,6 @@ async def _authenticate(request: Request, call_next):
     supplied_is_safe = (
         bool(separator)
         and scheme.lower() == "bearer"
-        and bool(supplied)
         and bearer_token_is_safe(supplied)
     )
     valid = supplied_is_safe and hmac.compare_digest(
