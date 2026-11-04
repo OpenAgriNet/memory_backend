@@ -29,6 +29,9 @@ class EligibleTest(unittest.TestCase):
         other_user["userId"] = "9123456780"
         self.assertIsNone(worker.eligible(other_user))
 
+    def test_int_farmer_id_as_langfuse_stores_it(self):
+        self.assertEqual(worker.eligible(row(**{"amul.farmer_id": 9876543210}))[0], "9876543210")
+
     def test_signed_in_voice_is_kept(self):
         self.assertIsNotNone(worker.eligible(row(**{"amul.pipeline": "telephony", "amul.signed_in": True})))
 

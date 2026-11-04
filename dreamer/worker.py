@@ -62,7 +62,8 @@ def write_mark(mark):
 
 
 def _phone(value):
-    digits = re.sub(r"\D", "", value) if isinstance(value, str) else ""
+    # Langfuse metadata carries amul.farmer_id as an int, userId as a string.
+    digits = re.sub(r"\D", "", str(value)) if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
     return digits[-10:] if len(digits) >= 10 and len(set(digits[-10:])) > 1 else None
 
 
@@ -82,7 +83,7 @@ def eligible(row):
         return None
     farmer = _phone(md.get("amul.farmer_id"))
     query, answer = row.get("input"), row.get("output")
-    if (not farmer or farmer != md.get("amul.farmer_id") or _phone(row.get("userId")) != farmer
+    if (not farmer or _phone(row.get("userId")) != farmer
             or not isinstance(query, str) or not query.strip()
             or not isinstance(answer, str) or not answer.strip()):
         return None
