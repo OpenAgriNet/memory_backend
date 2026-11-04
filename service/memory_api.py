@@ -37,6 +37,7 @@ Scope: this service creates and updates memory in Qdrant. That is all it does. I
 does no ranking beyond Qdrant's own vector search, no reasoning, and no scheduling.
 """
 import os
+import asyncio
 import hashlib
 import hmac
 import json
@@ -51,9 +52,10 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 if __package__:
-    from . import episode, profile_schema
+    from . import embedding, episode, profile_schema
     from .runtime_config import bearer_token_is_safe, memory_erase_point_id, memory_internal_token, required, qdrant_headers
 else:
+    import embedding
     import profile_schema
     import episode
     from runtime_config import bearer_token_is_safe, memory_erase_point_id, memory_internal_token, required, qdrant_headers
@@ -63,30 +65,20 @@ COLLECTION = os.getenv("QDRANT_COLLECTION", "amul_memory")
 MEMORY_INTERNAL_TOKEN = memory_internal_token()
 
 # ---------- embeddings ----------
-# Qdrant searches vectors but does not create them, so one external call is
-# unavoidable: text has to become numbers on the way in AND on the way out, with the
-# same model both times or the numbers aren't comparable.
-#
-# Today that call goes to the Marqo instance Amul already runs, using the same model
-# as Amul's knowledge base (multilingual-e5-large) — memory text is frequently
-# Gujarati, so an English-first model would be a poor fit, and reusing what is
-# already running means no second model to keep in sync.
-#
-# PLANNED: move to a dedicated, independently scalable embedding service. Marqo is a
-# search engine being used purely as an embedding endpoint, so it scales on its own
-# axis rather than ours. _embed_many below is the ONLY place text becomes vectors —
-# that one function is the whole migration surface. Whatever replaces it must return
-# EMBED_DIM-sized vectors from the same model family, or the collection has to be
-# re-embedded (see the startup check).
-MARQO_URL = required("MARQO_URL").rstrip("/")
-MARQO_INDEX = os.getenv("MARQO_INDEX", "amul-veterinary-index")
+# Qdrant searches vectors but does not create them, so text has to become numbers on
+# the way in AND on the way out, with the same model both times or the numbers aren't
+# comparable. embedding.py runs multilingual-e5-large in-process (FastEmbed), the same
+# model as Amul's knowledge base: memory text is frequently Gujarati. _embed_many below
+# is the ONLY place this service turns text into vectors.
 EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
 
 # Stamped onto every entry, so a future migration is detectable instead of silent.
 # The dangerous failure is not an outage — it is swapping the embedding service,
 # getting vectors back that are the right SHAPE but a different meaning, and having
 # every search quietly return nonsense with no error anywhere.
-EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", f"marqo:{MARQO_INDEX}/doc-query")
+# The default names the vector space, not the server: FastEmbed reproduces the vectors
+# Marqo wrote under this stamp exactly, so existing collections stay comparable.
+EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", "marqo:amul-veterinary-index/doc-query")
 
 # Internal record separation only. Memories have no category requirement. Older
 # records with category values remain readable and become plain memories on update.
@@ -279,26 +271,17 @@ async def _embed_many(texts: list[str], *, kind: str = "document") -> list[list[
 
     `kind` is "document" for text being stored and "query" for text being searched
     with, and it is not cosmetic. multilingual-e5-large is trained asymmetrically —
-    a stored passage and a question about it are meant to be encoded differently —
-    and Marqo exposes that through content_type. Measured on a labelled set of real
+    a stored passage and a question about it are meant to be encoded differently
+    (embedding.py adds the "passage: " / "query: " prefixes). Measured on a labelled set of real
     memory headlines and real farmer questions, using it lifted "did the search
     return the RIGHT memory" from 9/10 to 10/10.
-
-    Note that "query" is Marqo's default: plain text embeds identically to
-    content_type=query. So the thing that actually had to change was the write side,
-    which was storing memories encoded as though they were questions.
 
     Both sides must agree forever. Changing this convention makes every stored
     vector incomparable with new queries, which is why it is part of EMBED_MODEL_ID
     and why the startup check watches for it.
 
     Batched rather than one-at-a-time because a write needs two vectors (headline and
-    expanded) and a backfill needs thousands — one round trip per entry instead of
-    two, and a dedicated embedding service is exactly the kind of thing that batches
-    well. Order in equals order out.
-
-    This function is the entire migration surface: swapping Marqo for a dedicated
-    embedding service means changing this call and nothing else.
+    expanded) and a backfill needs thousands. Order in equals order out.
     """
     payload = [t if (t or "").strip() else " " for t in texts]
     if not payload:
@@ -306,12 +289,11 @@ async def _embed_many(texts: list[str], *, kind: str = "document") -> list[list[
 
     if kind not in ("document", "query"):
         raise HTTPException(500, f"bad embed kind {kind!r}")
-    async with httpx.AsyncClient(timeout=60) as c:
-        r = await c.post(f"{MARQO_URL}/indexes/{MARQO_INDEX}/embed",
-                         json={"content": payload, "content_type": kind})
-    if r.status_code != 200:
-        raise HTTPException(502, f"embedding failed: {r.text[:200]}")
-    vectors = r.json()["embeddings"]
+    try:
+        # CPU-bound: keep it off the event loop.
+        vectors = await asyncio.to_thread(embedding.embed, payload, kind)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"embedding failed: {exc}") from exc
 
     if len(vectors) != len(payload):
         raise HTTPException(
@@ -522,7 +504,7 @@ async def _startup() -> None:
             "will be meaningless until the collection is re-embedded."
         )
     else:
-        print(f"embeddings: {EMBED_MODEL_ID} ({EMBED_DIM}-dim) via {MARQO_URL}")
+        print(f"embeddings: {EMBED_MODEL_ID} ({EMBED_DIM}-dim) via {embedding.MODEL}")
 
 
 def _settings_point_id(farmer_id: str) -> str:

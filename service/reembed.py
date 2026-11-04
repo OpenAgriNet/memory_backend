@@ -16,14 +16,13 @@ import json
 import os
 import urllib.request
 
+import embedding
 import episode
 from runtime_config import required, qdrant_headers
 
 QDRANT = required("QDRANT_URL").rstrip("/")
 COLLECTION = os.getenv("QDRANT_COLLECTION", "amul_memory")
-MARQO = required("MARQO_URL").rstrip("/")
-MARQO_INDEX = os.getenv("MARQO_INDEX", "amul-veterinary-index")
-TARGET_STAMP = os.getenv("EMBED_MODEL_ID", f"marqo:{MARQO_INDEX}/doc-query")
+TARGET_STAMP = os.getenv("EMBED_MODEL_ID", "marqo:amul-veterinary-index/doc-query")
 # Types whose vectors are placeholders, never searched — no point embedding them.
 PLACEHOLDER_TYPES = {"settings", "key_doc", "profile_record", "memory_erase"}
 
@@ -35,9 +34,7 @@ def _post(url, body, method="POST"):
 
 
 def _embed(texts, kind):
-    return _post(f"{MARQO}/indexes/{MARQO_INDEX}/embed",
-                 {"content": [t if (t or "").strip() else " " for t in texts],
-                  "content_type": kind})["embeddings"]
+    return embedding.embed([t if (t or "").strip() else " " for t in texts], kind)
 
 
 def vector_texts(point, by_id):

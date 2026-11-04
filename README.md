@@ -29,7 +29,8 @@ and model endpoints. `.env` is ignored by git; process environment takes precede
 - `QDRANT_COLLECTION`: collection used by the memory service and repair commands.
 - `QDRANT_TASK_STATE_COLLECTION`: separate hash-only worker progress collection.
   It requires Qdrant 1.17+ and must not be set to `QDRANT_COLLECTION`.
-- `MARQO_URL`, `MARQO_INDEX`, `EMBED_DIM`: embedding service and vector configuration.
+- `EMBED_MODEL`, `EMBED_DIM`: embedding model (multilingual-e5-large, run in-process with
+  FastEmbed; set `FASTEMBED_CACHE_PATH` to reuse a downloaded copy) and vector size.
 - `DREAMER_BASE_URL`, `DREAMER_MODEL`: configured OpenAI-compatible model endpoint.
 - `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`: the source
   project for background learning. Set all three together; partial configuration
@@ -162,8 +163,9 @@ without a hidden write; an explicit internal index route can index their passage
 
 ## Infrastructure and local commands
 
-Qdrant owns the data and two named dense vectors (`headline`, `expanded`). Marqo supplies
-embeddings using the existing multilingual model's document/query conventions.
+Qdrant owns the data and two named dense vectors (`headline`, `expanded`). The service
+embeds in-process with FastEmbed (multilingual-e5-large, `passage: ` / `query: ` prefixes),
+the same vectors the earlier Marqo setup produced.
 Changing embedding models requires deliberate compatibility checking/re-embedding.
 
 Build the service from its own directory:
