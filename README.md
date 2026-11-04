@@ -8,10 +8,15 @@ with Gautam on 9 September 2026; no rollout is implied by these source changes.
   standing-record derivation from farmer chat traces.
 - `tests/`: offline regression tests plus a separate live-service integration suite.
 
-The reply-agent integration lives in `amul-oan-api` on branch `feat/memory_v0`.
-It reads Qdrant directly and uses Marqo for query embeddings. The background job
-independently consumes Langfuse and writes Qdrant through its private storage API;
-the bot has no runtime dependency on that API or this repository.
+Qdrant is the only store. The bot (`amul-oan-api`) reads memory through this
+service's `/internal/...` routes; `dreamer/worker.py` reads settled farmer turns from
+Langfuse and writes through the same API. Every route except `/health` needs
+`Authorization: Bearer $MEMORY_INTERNAL_TOKEN`.
+
+Run: `service/Dockerfile` (API, port 8100) and `dreamer/Dockerfile` (worker, build from
+the repo root). The worker's only state is a high-water mark in
+`MEMORY_WORKER_STATE_COLLECTION`; each cycle processes turns up to now minus
+`MEMORY_SETTLE_SECONDS`, one dreamer run per farmer.
 Start with [the design](../oan_horizon/future_work/memory_amul/memory-overview.md),
 [API contracts](../oan_horizon/future_work/memory_amul/api-and-integration.md), and
 [the review ledger](../oan_horizon/future_work/memory_amul/design-review-2026-09-09.md).
@@ -35,9 +40,11 @@ and model endpoints. `.env` is ignored by git; process environment takes precede
   fails explicitly. There is one active configuration and no credential-file or
   environment-selection fallback. The local demo now selects dev
   Langfuse; historical production backtests remain frozen in their run directories.
-- `MEMORY_API_URL`: private storage API called by the background job only. The bot
-  uses `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_COLLECTION` and its existing
-  `MARQO_ENDPOINT_URL`/`MARQO_INDEX_NAME` instead; see the bot's deployment guide.
+- `MEMORY_API_URL`, `MEMORY_INTERNAL_TOKEN`: the Memory API and its bearer token (API,
+  worker and bot share it).
+- `MEMORY_SCAN_INTERVAL_SECONDS`, `MEMORY_SETTLE_SECONDS`, `MEMORY_FIRST_LOOKBACK_SECONDS`,
+  `MEMORY_FARMER_ALLOWLIST`: worker cadence, settle delay, first-run window, optional
+  phone allowlist (empty = everyone).
 - `BACKTEST_API_URL`, `BACKTEST_COLLECTION`: isolated evaluation service and collection.
 
 Qdrant REST over HTTPS is sufficient; this implementation does not need gRPC.

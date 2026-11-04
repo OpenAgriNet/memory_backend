@@ -47,7 +47,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 import embedding
 import profile_schema
@@ -101,6 +102,17 @@ AGENT_HIDDEN_KEYS = {"animal_id", "account_no", "account_number", "transaction_i
 DEFAULT_MEMORY_ENABLED = True
 
 app = FastAPI(title="Amul memory API (test harness)")
+
+# Every caller (the bot's reads, the dreamer's writes) sends this token; only /health is open.
+_AUTH = f"Bearer {required('MEMORY_INTERNAL_TOKEN')}"
+
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next):
+    if request.url.path != "/health" and not hmac.compare_digest(
+            request.headers.get("authorization", "").encode(), _AUTH.encode()):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
 
 
 # ---------- models ----------

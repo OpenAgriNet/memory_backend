@@ -51,7 +51,8 @@ import os
 import re
 import sys
 
-import requests
+
+from memory_http import api
 
 import agent
 import dates
@@ -129,7 +130,7 @@ def batches(queues):
 
 def _known_keys():
     try:
-        r = requests.get(f"{MEMORY_API}/keys", timeout=30)
+        r = api.get(f"{MEMORY_API}/keys", timeout=30)
         r.raise_for_status()
         return [{"key": k["key"], "description": k.get("description")} for k in r.json()["keys"]]
     except Exception as exc:  # noqa: BLE001 - first run has no keys yet
@@ -165,7 +166,7 @@ def _candidates(farmer_id, entry):
     for q in queries:
         for path in ("search", "search_expanded"):
             try:
-                r = requests.post(
+                r = api.post(
                     f"{MEMORY_API}/internal/memory/{farmer_id}/{path}",
                     json={"query": q, "limit": CANDIDATE_POOL, "only_current": True},
                     timeout=60,
@@ -341,7 +342,7 @@ def process_chunk(farmer_id, turns, known_keys, dry_run=False, headline_pass=Tru
         if dry_run:
             continue
         try:
-            requests.post(f"{MEMORY_API}/keys/doc", json={
+            api.post(f"{MEMORY_API}/keys/doc", json={
                 "key": nk["key"], "description": nk["description"]}, timeout=30).raise_for_status()
         except Exception as exc:  # noqa: BLE001
             print(f"  ! could not document key {nk.get('key')!r}: {exc}", file=sys.stderr)
@@ -449,7 +450,7 @@ def _current_entries(farmer_id):
         params = {"limit": 100, "only_current": "true"}
         if cursor:
             params["cursor"] = cursor
-        response = requests.get(f"{MEMORY_API}/internal/memory/{farmer_id}/entries",
+        response = api.get(f"{MEMORY_API}/internal/memory/{farmer_id}/entries",
                                 params=params, timeout=60)
         response.raise_for_status()
         body = response.json()
@@ -611,7 +612,7 @@ def update_profile(farmer_id, dry_run=False, recent_asks=()):
     phrasing, and the Layer-2 headlines have paraphrased it away.
     """
     try:
-        cur = requests.get(f"{MEMORY_API}/internal/memory/{farmer_id}/profile", timeout=30)
+        cur = api.get(f"{MEMORY_API}/internal/memory/{farmer_id}/profile", timeout=30)
         cur.raise_for_status()
         current = cur.json().get("profile") or {}
         headlines = sorted(_current_entries(farmer_id),
@@ -660,6 +661,64 @@ def update_profile(farmer_id, dry_run=False, recent_asks=()):
 
 
 # --------------------------------------------------------------------------
+
+def dream(queues, args):
+    """Run every farmer's chunks in order, then consolidate and refresh their profile."""
+    known_keys = _known_keys()
+    remaining = {fid: len(q) for fid, q in queues.items()}
+    asks = {fid: [] for fid in queues}
+    total = 0
+
+    for bno, batch in enumerate(batches(queues), 1):
+        print(f"\n=== batch {bno}: {len(batch)} farmer(s), one chunk each ===")
+        for fid, ci, chunk in batch:
+            span = f"{(chunk[0].get('ts') or '')[:10]}"
+            # Keep the most recent handful of the farmer's own questions for the
+            # Layer-1 pass. Bounded on both counts — a standing record derived from
+            # a huge sample is no better, and the prompt has to stay small.
+            asks[fid] = ([(t.get("query") or "").strip()[:200]
+                          for t in chunk if (t.get("query") or "").strip()]
+                         + asks[fid])[:10]
+            if args.pipeline:
+                written, known_keys = process_chunk(
+                    fid, chunk, known_keys,
+                    dry_run=args.dry_run, headline_pass=not args.no_headline_pass,
+                )
+            else:
+                written, known_keys = process_chunk_agent(
+                    fid, chunk, known_keys, dry_run=args.dry_run)
+            # Count only what actually landed. Refusals are useful to see but they
+            # are not writes, and reporting them as such overstates the work done.
+            total += sum(1 for w in written if w["action"] in ("write", "update", "fold",
+                                                               "would-write", "would-update"))
+            landed = sum(1 for w in written if w["action"] not in ("REFUSED", "nothing"))
+            refused = sum(1 for w in written if w["action"] == "REFUSED")
+            print(f"...{str(fid)[-4:]} chunk {ci + 1}/{remaining[fid]} {span} "
+                  f"{len(chunk):>2} turns -> {landed} written"
+                  + (f", {refused} refused" if refused else ""))
+            for w in written:
+                e = w["entry"]
+                print(f"      {w['action']:12} [{e['status']}] {e['headline'][:88]}")
+                if w.get("reason") and w["action"] == "REFUSED":
+                    print(f"        reason: {w['reason']}")
+
+            # The farmer's queue is drained. Consolidate BEFORE the standing record,
+            # so Layer 1 is derived from whole situations rather than fragments.
+            if ci + 1 == remaining[fid] and not args.no_consolidate:
+                merges = consolidate(fid, dry_run=args.dry_run, known_keys=known_keys)
+                for situation, kept, folded in merges:
+                    print(f"      {'would-' if args.dry_run else ''}merged {len(folded) + 1} "
+                          f"entries -> 1: {situation[:64]}")
+                if not merges:
+                    print("      consolidation: nothing to merge")
+            if ci + 1 == remaining[fid] and not args.no_profile_pass:
+                fields = update_profile(fid, dry_run=args.dry_run, recent_asks=asks[fid])
+                if fields:
+                    print(f"      {'would-' if args.dry_run else ''}standing record: "
+                          + "; ".join(f"{k}={v}" for k, v in fields.items()))
+
+    print(f"\ntotal entries {'that would be ' if args.dry_run else ''}written: {total}")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -726,60 +785,7 @@ def main():
         print("nothing to dream about")
         return
 
-    known_keys = _known_keys()
-    remaining = {fid: len(q) for fid, q in queues.items()}
-    asks = {fid: [] for fid in queues}
-    total = 0
-
-    for bno, batch in enumerate(batches(queues), 1):
-        print(f"\n=== batch {bno}: {len(batch)} farmer(s), one chunk each ===")
-        for fid, ci, chunk in batch:
-            span = f"{(chunk[0].get('ts') or '')[:10]}"
-            # Keep the most recent handful of the farmer's own questions for the
-            # Layer-1 pass. Bounded on both counts — a standing record derived from
-            # a huge sample is no better, and the prompt has to stay small.
-            asks[fid] = ([(t.get("query") or "").strip()[:200]
-                          for t in chunk if (t.get("query") or "").strip()]
-                         + asks[fid])[:10]
-            if args.pipeline:
-                written, known_keys = process_chunk(
-                    fid, chunk, known_keys,
-                    dry_run=args.dry_run, headline_pass=not args.no_headline_pass,
-                )
-            else:
-                written, known_keys = process_chunk_agent(
-                    fid, chunk, known_keys, dry_run=args.dry_run)
-            # Count only what actually landed. Refusals are useful to see but they
-            # are not writes, and reporting them as such overstates the work done.
-            total += sum(1 for w in written if w["action"] in ("write", "update", "fold",
-                                                               "would-write", "would-update"))
-            landed = sum(1 for w in written if w["action"] not in ("REFUSED", "nothing"))
-            refused = sum(1 for w in written if w["action"] == "REFUSED")
-            print(f"...{str(fid)[-4:]} chunk {ci + 1}/{remaining[fid]} {span} "
-                  f"{len(chunk):>2} turns -> {landed} written"
-                  + (f", {refused} refused" if refused else ""))
-            for w in written:
-                e = w["entry"]
-                print(f"      {w['action']:12} [{e['status']}] {e['headline'][:88]}")
-                if w.get("reason") and w["action"] == "REFUSED":
-                    print(f"        reason: {w['reason']}")
-
-            # The farmer's queue is drained. Consolidate BEFORE the standing record,
-            # so Layer 1 is derived from whole situations rather than fragments.
-            if ci + 1 == remaining[fid] and not args.no_consolidate:
-                merges = consolidate(fid, dry_run=args.dry_run, known_keys=known_keys)
-                for situation, kept, folded in merges:
-                    print(f"      {'would-' if args.dry_run else ''}merged {len(folded) + 1} "
-                          f"entries -> 1: {situation[:64]}")
-                if not merges:
-                    print("      consolidation: nothing to merge")
-            if ci + 1 == remaining[fid] and not args.no_profile_pass:
-                fields = update_profile(fid, dry_run=args.dry_run, recent_asks=asks[fid])
-                if fields:
-                    print(f"      {'would-' if args.dry_run else ''}standing record: "
-                          + "; ".join(f"{k}={v}" for k, v in fields.items()))
-
-    print(f"\ntotal entries {'that would be ' if args.dry_run else ''}written: {total}")
+    dream(queues, args)
 
 
 if __name__ == "__main__":

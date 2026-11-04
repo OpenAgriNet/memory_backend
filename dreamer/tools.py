@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from copy import copy
 
-import requests
+from memory_http import api
 
 import dates
 import writer
@@ -73,7 +73,7 @@ _strip_ids = writer.strip_identifiers
 
 def search_memory(ctx: Ctx, query: str, detail: bool = False, limit: int = 8, memory_ref: str | None = None) -> dict:
     path = "/search_expanded" if detail else "/search"
-    r = requests.post(ctx._url(path),
+    r = api.post(ctx._url(path),
                       json={"query": query, "limit": min(limit, 20), "only_current": True, "memory_ref": memory_ref},
                       timeout=60)
     r.raise_for_status()
@@ -103,7 +103,7 @@ def list_memory(ctx: Ctx, status: str | None = None,
             params[k] = v
     if cursor:
         params["cursor"] = cursor
-    r = requests.get(ctx._url("/entries"), params=params, timeout=60)
+    r = api.get(ctx._url("/entries"), params=params, timeout=60)
     r.raise_for_status()
     body = r.json()
     if body.get("memory_enabled") is False:
@@ -124,7 +124,7 @@ def list_memory(ctx: Ctx, status: str | None = None,
 
 def read_memory(ctx: Ctx, entry_id: str, chunk_ids: list[int] | None = None) -> dict:
     """Read selected evidence, following explicit continuation before rewriting."""
-    response = requests.post(ctx._url(f"/entries/{entry_id}/read"), json={
+    response = api.post(ctx._url(f"/entries/{entry_id}/read"), json={
         "chunk_ids": chunk_ids, "whole_chunks": True}, timeout=60)
     response.raise_for_status()
     body = response.json()
@@ -133,7 +133,7 @@ def read_memory(ctx: Ctx, entry_id: str, chunk_ids: list[int] | None = None) -> 
 
 
 def known_keys(ctx: Ctx) -> dict:
-    r = requests.get(f"{ctx.api}/keys", timeout=30)
+    r = api.get(f"{ctx.api}/keys", timeout=30)
     r.raise_for_status()
     ks = r.json().get("keys", [])
     ctx.known_keys = [{"key": k["key"], "description": k.get("description")} for k in ks]
@@ -183,7 +183,7 @@ def document_key(ctx: Ctx, key: str, description: str) -> dict:
     if ctx.dry_run:
         return {"documented": True, "dry_run": True}
     try:
-        requests.post(f"{ctx.api}/keys/doc",
+        api.post(f"{ctx.api}/keys/doc",
                       json={"key": key, "description": description},
                       timeout=30).raise_for_status()
     except Exception as exc:  # noqa: BLE001
