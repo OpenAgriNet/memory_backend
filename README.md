@@ -45,6 +45,10 @@ and model endpoints. `.env` is ignored by git; process environment takes precede
 - `MEMORY_SCAN_INTERVAL_SECONDS`, `MEMORY_SETTLE_SECONDS`, `MEMORY_FIRST_LOOKBACK_SECONDS`,
   `MEMORY_FARMER_ALLOWLIST`: worker cadence, settle delay, first-run window, optional
   phone allowlist (empty = everyone).
+- `MEMORY_LOG_CONTENT` (default off): when off, the worker log keeps only counts; the
+  dreamer's headlines, notes, model replies and error text are dropped. Turn it on only
+  where reading farmer summaries in the log is acceptable (dev). The API's access log
+  carries the farmer's phone in each path; set `UVICORN_ACCESS_LOG=false` to drop it.
 - `BACKTEST_API_URL`, `BACKTEST_COLLECTION`: isolated evaluation service and collection.
 
 Qdrant REST over HTTPS is sufficient; this implementation does not need gRPC.

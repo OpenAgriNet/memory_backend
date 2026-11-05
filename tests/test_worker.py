@@ -1,7 +1,10 @@
 """Which Langfuse turns the worker hands to the dreamer."""
+import contextlib
+import io
 import os
 import sys
 import unittest
+from unittest import mock
 
 import env_fixture  # noqa: F401
 
@@ -34,6 +37,40 @@ class EligibleTest(unittest.TestCase):
 
     def test_signed_in_voice_is_kept(self):
         self.assertIsNotNone(worker.eligible(row(**{"amul.pipeline": "telephony", "amul.signed_in": True})))
+
+
+class QuietLogTest(unittest.TestCase):
+    def run_cycle(self, log_content, dream):
+        out = io.StringIO()
+        with mock.patch.object(worker, "LOG_CONTENT", log_content), \
+                mock.patch.object(worker, "read_mark", return_value=None), \
+                mock.patch.object(worker, "write_mark"), \
+                mock.patch.object(worker.lf, "LangfuseRO") as ro, \
+                mock.patch.object(worker.dreamer, "dream", side_effect=dream), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            ro.return_value.traces.return_value = [row()]
+            worker.cycle()
+        return out.getvalue()
+
+    def test_quiet_log_keeps_counts_only(self):
+        def dream(queues, args):
+            print("headline: cow Gauri got Ceftriaxone")
+            print("note: farmer worried", file=sys.stderr)
+            return 1
+        log = self.run_cycle(False, dream)
+        self.assertNotIn("Gauri", log)
+        self.assertNotIn("worried", log)
+        self.assertIn("1 turns -> 1 written", log)
+
+    def test_quiet_log_hides_error_text(self):
+        def dream(queues, args):
+            raise ValueError("LLM said: cow Gauri got Ceftriaxone")
+        log = self.run_cycle(False, dream)
+        self.assertNotIn("Gauri", log)
+        self.assertIn("failed: ValueError", log)
+
+    def test_content_log_when_enabled(self):
+        self.assertIn("Gauri", self.run_cycle(True, lambda q, a: print("cow Gauri") or 1))
 
 
 if __name__ == "__main__":

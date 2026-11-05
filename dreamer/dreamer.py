@@ -718,6 +718,7 @@ def dream(queues, args):
                           + "; ".join(f"{k}={v}" for k, v in fields.items()))
 
     print(f"\ntotal entries {'that would be ' if args.dry_run else ''}written: {total}")
+    return total
 
 
 def main():

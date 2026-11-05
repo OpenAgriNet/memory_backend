@@ -13,7 +13,9 @@ window is not retried for them.
   python worker.py --once --dry-run   # decide, write nothing, leave the mark alone
 """
 import argparse
+import contextlib
 import datetime as dt
+import io
 import os
 import re
 import time
@@ -35,6 +37,9 @@ INTERVAL = int(os.getenv("MEMORY_SCAN_INTERVAL_SECONDS", str(30 * 60)))
 FIRST_LOOKBACK = dt.timedelta(seconds=int(os.getenv("MEMORY_FIRST_LOOKBACK_SECONDS", str(24 * 3600))))
 # Comma-separated phones; empty means every eligible farmer.
 ALLOWLIST = {p.strip()[-10:] for p in os.getenv("MEMORY_FARMER_ALLOWLIST", "").split(",") if p.strip()}
+# Off: the dreamer's own output (headlines, notes, LLM replies, error text) is discarded,
+# and the log keeps only counts. Prod runs with it off.
+LOG_CONTENT = os.getenv("MEMORY_LOG_CONTENT", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _qdrant(method, path, body=None):
@@ -91,6 +96,12 @@ def eligible(row):
                     "query": query.strip(), "answer": answer.strip()}
 
 
+@contextlib.contextmanager
+def _discard():
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        yield
+
+
 def cycle(dry_run=False):
     now = dt.datetime.now(dt.timezone.utc)
     start = read_mark() or now - FIRST_LOOKBACK
@@ -111,11 +122,16 @@ def cycle(dry_run=False):
     failed = 0
     for farmer, by_id in turns.items():
         ordered = sorted(by_id.values(), key=lambda t: t["ts"] or "")
+        sink = contextlib.nullcontext() if LOG_CONTENT else _discard()
         try:
-            dreamer.dream({farmer: dreamer.chunk_turns(ordered)}, args)
-        except Exception:  # noqa: BLE001 - one farmer must not stop the others
+            with sink:
+                written = dreamer.dream({farmer: dreamer.chunk_turns(ordered)}, args)
+            if not LOG_CONTENT:
+                print(f"farmer ...{farmer[-4:]}: {len(ordered)} turns -> {written} written")
+        except Exception as exc:  # noqa: BLE001 - one farmer must not stop the others
             failed += 1
-            print(f"farmer ...{farmer[-4:]} failed:\n{traceback.format_exc()}")
+            print(f"farmer ...{farmer[-4:]} failed: "
+                  + (traceback.format_exc() if LOG_CONTENT else type(exc).__name__))
     if not dry_run:
         write_mark(stop)
     print(f"cycle done: {len(turns) - failed} ok, {failed} failed")
