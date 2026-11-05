@@ -171,6 +171,17 @@ The default is the tool-using agent. `--pipeline` retains the older baseline for
 comparison; it is not an automatic fallback. Credentials are resolved at runtime,
 never copied into memory or these docs. Langfuse access is read-only.
 
+### Queue worker boundary
+
+A v2 message describes one part of a farmer's numbered chat or voice episode.
+It carries ordered turns and identifies which traces are newly pending. The
+episode key is shared across parts and revisions. The task key identifies the
+exact message for safe redelivery.
+
+A message is limited to 100 turns, 128,000 conversation characters, and 256 KiB.
+The worker acknowledges success, retries temporary failures, and dead-letters
+invalid messages and permanent failures.
+
 ## Verification
 
 Offline, with no service/model calls:
