@@ -48,7 +48,9 @@ class AllowlistTest(unittest.TestCase):
                 mock.patch.object(worker.lf, "LangfuseRO") as ro, \
                 mock.patch.object(worker.dreamer, "dream", dream), \
                 contextlib.redirect_stdout(io.StringIO()):
-            ro.return_value.traces.return_value = rows
+            # Langfuse's userId filter is an exact match.
+            ro.return_value.traces.side_effect = lambda start, stop, **kw: [
+                r for r in rows if "userId" not in kw or r["userId"] == kw["userId"]]
             worker.cycle()
         return ro.return_value.traces, dream
 
@@ -62,9 +64,22 @@ class AllowlistTest(unittest.TestCase):
         self.assertEqual(traces.call_args.kwargs["userId"], "9876543210")
         self.assertEqual(list(dream.call_args.args[0]), ["9876543210"])
 
+    def test_listed_farmer_is_found_under_every_user_id_form(self):
+        for user_id in ("9876543210", "+919876543210", "919876543210"):
+            rec = row()
+            rec["userId"] = user_id
+            _, dream = self.run_cycle({"9876543210"}, [rec])
+            self.assertEqual(list(dream.call_args.args[0]), ["9876543210"], user_id)
+
     def test_row_outside_the_list_is_dropped(self):
         _, dream = self.run_cycle({"9123456780"}, [row()])
         dream.assert_not_called()
+
+    def test_list_parsing(self):
+        self.assertEqual(worker._parse_allowlist(""), set())
+        self.assertEqual(worker._parse_allowlist(" , all"), set())
+        self.assertEqual(worker._parse_allowlist("*"), {"*"})
+        self.assertEqual(worker._parse_allowlist("+91 98765 43210,9123456780"), {"9876543210", "9123456780"})
 
     def test_star_is_everyone(self):
         traces, dream = self.run_cycle({"*"}, [row()])

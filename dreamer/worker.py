@@ -37,8 +37,14 @@ INTERVAL = int(os.getenv("MEMORY_SCAN_INTERVAL_SECONDS", str(30 * 60)))
 FIRST_LOOKBACK = dt.timedelta(seconds=int(os.getenv("MEMORY_FIRST_LOOKBACK_SECONDS", str(24 * 3600))))
 # Who gets memory written: comma-separated phones, or * for every eligible farmer.
 # Empty or unset is nobody.
-ALLOWLIST = {"*" if p.strip() == "*" else re.sub(r"\D", "", p)[-10:]
-             for p in os.getenv("MEMORY_FARMER_ALLOWLIST", "").split(",") if p.strip()}
+def _parse_allowlist(value):
+    entries = {"*" if p.strip() == "*" else re.sub(r"\D", "", p)[-10:] for p in value.split(",")}
+    return entries - {""}
+
+
+ALLOWLIST = _parse_allowlist(os.getenv("MEMORY_FARMER_ALLOWLIST", ""))
+# The bot writes userId as the caller gave it, and Langfuse filters on the exact string.
+USER_ID_FORMS = ("{}", "+91{}", "91{}")
 # Off: the dreamer's own output (headlines, notes, LLM replies, error text) is discarded,
 # and the log keeps only counts. Prod runs with it off.
 LOG_CONTENT = os.getenv("MEMORY_LOG_CONTENT", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -103,8 +109,8 @@ def read_turns(start, stop):
     reader = lf.LangfuseRO()
     if "*" in ALLOWLIST:
         return reader.traces(start, stop, name=lf.TURN_TRACE_NAME)
-    return [row for phone in sorted(ALLOWLIST)
-            for row in reader.traces(start, stop, name=lf.TURN_TRACE_NAME, userId=phone)]
+    return [row for phone in sorted(ALLOWLIST) for form in USER_ID_FORMS
+            for row in reader.traces(start, stop, name=lf.TURN_TRACE_NAME, userId=form.format(phone))]
 
 
 @contextlib.contextmanager
