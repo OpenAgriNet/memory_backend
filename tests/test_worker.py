@@ -71,8 +71,9 @@ class AllowlistTest(unittest.TestCase):
             _, dream = self.run_cycle({"9876543210"}, [rec])
             self.assertEqual(list(dream.call_args.args[0]), ["9876543210"], user_id)
 
-    def test_row_outside_the_list_is_dropped(self):
-        _, dream = self.run_cycle({"9123456780"}, [row()])
+    def test_row_outside_the_list_is_dropped_even_if_langfuse_returns_it(self):
+        with mock.patch.object(worker, "read_turns", return_value=[row()]):
+            _, dream = self.run_cycle({"9123456780"}, [])
         dream.assert_not_called()
 
     def test_list_parsing(self):
