@@ -39,10 +39,44 @@ class EligibleTest(unittest.TestCase):
         self.assertIsNotNone(worker.eligible(row(**{"amul.pipeline": "telephony", "amul.signed_in": True})))
 
 
+class AllowlistTest(unittest.TestCase):
+    def run_cycle(self, allowlist, rows):
+        dream = mock.Mock(return_value=0)
+        with mock.patch.object(worker, "ALLOWLIST", allowlist), \
+                mock.patch.object(worker, "read_mark", return_value=None), \
+                mock.patch.object(worker, "write_mark"), \
+                mock.patch.object(worker.lf, "LangfuseRO") as ro, \
+                mock.patch.object(worker.dreamer, "dream", dream), \
+                contextlib.redirect_stdout(io.StringIO()):
+            ro.return_value.traces.return_value = rows
+            worker.cycle()
+        return ro.return_value.traces, dream
+
+    def test_empty_list_reads_and_writes_nothing(self):
+        traces, dream = self.run_cycle(set(), [row()])
+        traces.assert_not_called()
+        dream.assert_not_called()
+
+    def test_list_is_read_per_farmer(self):
+        traces, dream = self.run_cycle({"9876543210"}, [row()])
+        self.assertEqual(traces.call_args.kwargs["userId"], "9876543210")
+        self.assertEqual(list(dream.call_args.args[0]), ["9876543210"])
+
+    def test_row_outside_the_list_is_dropped(self):
+        _, dream = self.run_cycle({"9123456780"}, [row()])
+        dream.assert_not_called()
+
+    def test_star_is_everyone(self):
+        traces, dream = self.run_cycle({"*"}, [row()])
+        self.assertNotIn("userId", traces.call_args.kwargs)
+        self.assertEqual(list(dream.call_args.args[0]), ["9876543210"])
+
+
 class QuietLogTest(unittest.TestCase):
     def run_cycle(self, log_content, dream):
         out = io.StringIO()
         with mock.patch.object(worker, "LOG_CONTENT", log_content), \
+                mock.patch.object(worker, "ALLOWLIST", {"*"}), \
                 mock.patch.object(worker, "read_mark", return_value=None), \
                 mock.patch.object(worker, "write_mark"), \
                 mock.patch.object(worker.lf, "LangfuseRO") as ro, \

@@ -43,8 +43,9 @@ and model endpoints. `.env` is ignored by git; process environment takes precede
 - `MEMORY_API_URL`, `MEMORY_INTERNAL_TOKEN`: the Memory API and its bearer token (API,
   worker and bot share it).
 - `MEMORY_SCAN_INTERVAL_SECONDS`, `MEMORY_SETTLE_SECONDS`, `MEMORY_FIRST_LOOKBACK_SECONDS`,
-  `MEMORY_FARMER_ALLOWLIST`: worker cadence, settle delay, first-run window, optional
-  phone allowlist (empty = everyone).
+  `MEMORY_FARMER_ALLOWLIST`: worker cadence, settle delay, first-run window, and who gets
+  memory written (comma-separated phones, read from Langfuse one farmer at a time, or `*`
+  for every eligible farmer; empty = nobody).
 - `MEMORY_LOG_CONTENT` (default off): when off, the worker log keeps only counts; the
   dreamer's headlines, notes, model replies and error text are dropped. Turn it on only
   where reading farmer summaries in the log is acceptable (dev). The API's access log
