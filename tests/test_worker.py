@@ -39,10 +39,60 @@ class EligibleTest(unittest.TestCase):
         self.assertIsNotNone(worker.eligible(row(**{"amul.pipeline": "telephony", "amul.signed_in": True})))
 
 
+class AllowlistTest(unittest.TestCase):
+    def run_cycle(self, allowlist, rows):
+        dream = mock.Mock(return_value=0)
+        with mock.patch.object(worker, "ALLOWLIST", allowlist), \
+                mock.patch.object(worker, "read_mark", return_value=None), \
+                mock.patch.object(worker, "write_mark"), \
+                mock.patch.object(worker.lf, "LangfuseRO") as ro, \
+                mock.patch.object(worker.dreamer, "dream", dream), \
+                contextlib.redirect_stdout(io.StringIO()):
+            # Langfuse's userId filter is an exact match.
+            ro.return_value.traces.side_effect = lambda start, stop, **kw: [
+                r for r in rows if "userId" not in kw or r["userId"] == kw["userId"]]
+            worker.cycle()
+        return ro.return_value.traces, dream
+
+    def test_empty_list_reads_and_writes_nothing(self):
+        traces, dream = self.run_cycle(set(), [row()])
+        traces.assert_not_called()
+        dream.assert_not_called()
+
+    def test_list_is_read_per_farmer(self):
+        traces, dream = self.run_cycle({"9876543210"}, [row()])
+        self.assertEqual({c.kwargs["userId"][-10:] for c in traces.call_args_list}, {"9876543210"})
+        self.assertEqual(list(dream.call_args.args[0]), ["9876543210"])
+
+    def test_listed_farmer_is_found_under_every_user_id_form(self):
+        for user_id in ("9876543210", "+919876543210", "919876543210"):
+            rec = row()
+            rec["userId"] = user_id
+            _, dream = self.run_cycle({"9876543210"}, [rec])
+            self.assertEqual(list(dream.call_args.args[0]), ["9876543210"], user_id)
+
+    def test_row_outside_the_list_is_dropped_even_if_langfuse_returns_it(self):
+        with mock.patch.object(worker, "read_turns", return_value=[row()]):
+            _, dream = self.run_cycle({"9123456780"}, [])
+        dream.assert_not_called()
+
+    def test_list_parsing(self):
+        self.assertEqual(worker._parse_allowlist(""), set())
+        self.assertEqual(worker._parse_allowlist(" , all"), set())
+        self.assertEqual(worker._parse_allowlist("*"), {"*"})
+        self.assertEqual(worker._parse_allowlist("+91 98765 43210,9123456780"), {"9876543210", "9123456780"})
+
+    def test_star_is_everyone(self):
+        traces, dream = self.run_cycle({"*"}, [row()])
+        self.assertNotIn("userId", traces.call_args.kwargs)
+        self.assertEqual(list(dream.call_args.args[0]), ["9876543210"])
+
+
 class QuietLogTest(unittest.TestCase):
     def run_cycle(self, log_content, dream):
         out = io.StringIO()
         with mock.patch.object(worker, "LOG_CONTENT", log_content), \
+                mock.patch.object(worker, "ALLOWLIST", {"*"}), \
                 mock.patch.object(worker, "read_mark", return_value=None), \
                 mock.patch.object(worker, "write_mark"), \
                 mock.patch.object(worker.lf, "LangfuseRO") as ro, \

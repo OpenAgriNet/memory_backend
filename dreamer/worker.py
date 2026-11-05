@@ -35,8 +35,16 @@ STATE_POINT = str(uuid.uuid5(uuid.NAMESPACE_URL, "amul-memory-worker:high-water-
 SETTLE = dt.timedelta(seconds=int(os.getenv("MEMORY_SETTLE_SECONDS", str(40 * 60))))
 INTERVAL = int(os.getenv("MEMORY_SCAN_INTERVAL_SECONDS", str(30 * 60)))
 FIRST_LOOKBACK = dt.timedelta(seconds=int(os.getenv("MEMORY_FIRST_LOOKBACK_SECONDS", str(24 * 3600))))
-# Comma-separated phones; empty means every eligible farmer.
-ALLOWLIST = {p.strip()[-10:] for p in os.getenv("MEMORY_FARMER_ALLOWLIST", "").split(",") if p.strip()}
+# Who gets memory written: comma-separated phones, or * for every eligible farmer.
+# Empty or unset is nobody.
+def _parse_allowlist(value):
+    entries = {"*" if p.strip() == "*" else re.sub(r"\D", "", p)[-10:] for p in value.split(",")}
+    return entries - {""}
+
+
+ALLOWLIST = _parse_allowlist(os.getenv("MEMORY_FARMER_ALLOWLIST", ""))
+# The bot writes userId as the caller gave it, and Langfuse filters on the exact string.
+USER_ID_FORMS = ("{}", "+91{}", "91{}")
 # Off: the dreamer's own output (headlines, notes, LLM replies, error text) is discarded,
 # and the log keeps only counts. Prod runs with it off.
 LOG_CONTENT = os.getenv("MEMORY_LOG_CONTENT", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -96,6 +104,15 @@ def eligible(row):
                     "query": query.strip(), "answer": answer.strip()}
 
 
+def read_turns(start, stop):
+    """A short list is read farmer by farmer, so Langfuse never scans all of prod for it."""
+    reader = lf.LangfuseRO()
+    if "*" in ALLOWLIST:
+        return reader.traces(start, stop, name=lf.TURN_TRACE_NAME)
+    return [row for phone in sorted(ALLOWLIST) for form in USER_ID_FORMS
+            for row in reader.traces(start, stop, name=lf.TURN_TRACE_NAME, userId=form.format(phone))]
+
+
 @contextlib.contextmanager
 def _discard():
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -109,11 +126,11 @@ def cycle(dry_run=False):
     if stop <= start:
         print(f"nothing settled since {start.isoformat()}")
         return
-    rows = lf.LangfuseRO().traces(start, stop, name=lf.TURN_TRACE_NAME)
+    rows = read_turns(start, stop)
     turns = {}
     for row in rows:
         hit = eligible(row)
-        if hit and (not ALLOWLIST or hit[0] in ALLOWLIST):
+        if hit and ("*" in ALLOWLIST or hit[0] in ALLOWLIST):
             turns.setdefault(hit[0], {})[hit[1]["trace_id"]] = hit[1]
     print(f"window {start.isoformat()} .. {stop.isoformat()}: {len(rows)} turn traces, "
           f"{sum(len(t) for t in turns.values())} eligible from {len(turns)} farmer(s)")
