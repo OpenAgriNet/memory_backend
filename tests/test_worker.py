@@ -61,7 +61,7 @@ class AllowlistTest(unittest.TestCase):
 
     def test_list_is_read_per_farmer(self):
         traces, dream = self.run_cycle({"9876543210"}, [row()])
-        self.assertEqual(traces.call_args.kwargs["userId"], "9876543210")
+        self.assertEqual({c.kwargs["userId"][-10:] for c in traces.call_args_list}, {"9876543210"})
         self.assertEqual(list(dream.call_args.args[0]), ["9876543210"])
 
     def test_listed_farmer_is_found_under_every_user_id_form(self):
